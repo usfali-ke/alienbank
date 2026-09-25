@@ -1,0 +1,156 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: alienbank
+---
+# Non-secret runtime config — every parameter that changes from one environment
+# to another lives here, so moving between clusters/backends is a ConfigMap edit
+# (never an image rebuild). Only true secrets (Bedrock token, session key) live
+# in the `alienbank-secrets` Secret, created out-of-band from .env — see
+# k8s/README.md. After editing this ConfigMap, restart to pick it up:
+#   kubectl -n alienbank rollout restart deploy/alienbank
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alienbank-config
+  namespace: alienbank
+data:
+  # --- Web server ---
+  ALIENBANK_HOST: "0.0.0.0"
+  ALIENBANK_PORT: "8080"
+
+  # --- Security-lab toggles (see README) ---
+  # secure_agent=false + level=0 = the vulnerable naive baseline.
+  ALIENBANK_SECURE_AGENT: "false"
+  ALIENBANK_LEVEL: "0"
+
+  # --- Chat LLM provider: "bedrock" or "ollama" ---
+  # Each provider keeps its own model, so switching is a one-line change.
+  ALIENBANK_LLM_PROVIDER: "bedrock"
+  ALIENBANK_LLM_MAX_TOKENS: "5000"
+  ALIENBANK_LLM_TEMPERATURE: "0"
+  # bedrock (OpenAI-compatible chat proxy)
+  BEDROCK_BASE_URL: "https://bedrock-mantle.eu-west-2.api.aws/v1"
+  ALIENBANK_BEDROCK_MODEL: "qwen.qwen3-235b-a22b-2507"
+  # ollama (local, OpenAI-compatible) — point at a reachable host to enable.
+  OLLAMA_BASE_URL: "http://host.docker.internal:11434/v1"
+  ALIENBANK_OLLAMA_MODEL: "qwen2.5:3b-instruct"
+
+  # --- D2 guard model (LLM ATTACK/SAFE classifier, local Ollama) ---
+  ALIENBANK_GUARD_MODEL: "qwen2.5:3b-instruct"
+  ALIENBANK_GUARD_BASE_URL: "http://host.docker.internal:11434/v1"
+
+  # --- D6 external prompt-injection guard (L2+; off => FAIL OPEN) ---
+  # Backend: "ollama" (local LLM-judge, recommended) | "granite" | "bedrock".
+  ALIENBANK_INJECTION_GUARD: "false"
+  ALIENBANK_INJECTION_GUARD_BACKEND: "ollama"
+  ALIENBANK_INJECTION_GUARD_THRESHOLD: "0.5"
+  # ollama judge — MUST be an INSTRUCT model (a reasoning model fails open).
+  ALIENBANK_INJECTION_GUARD_MODEL: "qwen2.5:3b-instruct"
+  ALIENBANK_INJECTION_GUARD_BASE_URL: "http://host.docker.internal:11434/v1"
+  # bedrock backend — set these to switch D6 to AWS Bedrock Guardrails
+  # (reuses AWS_BEARER_TOKEN_BEDROCK from the Secret). Base URL must be the
+  # NATIVE runtime host, not the chat proxy.
+  ALIENBANK_BEDROCK_GUARDRAIL_ID: ""
+  ALIENBANK_BEDROCK_GUARDRAIL_VERSION: "DRAFT"
+  ALIENBANK_BEDROCK_GUARDRAIL_BASE_URL: "https://bedrock-runtime.eu-west-2.amazonaws.com"
+
+  # --- Agentic RAG: embeddings (Ollama) + ChromaDB ---
+  ALIENBANK_EMBED_MODEL: "bge-m3"
+  ALIENBANK_EMBED_BASE_URL: "http://host.docker.internal:11434/v1"
+  ALIENBANK_RAG_TOP_K: "4"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alienbank
+  namespace: alienbank
+  labels:
+    app: alienbank
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: alienbank
+  template:
+    metadata:
+      labels:
+        app: alienbank
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        fsGroup: 999
+      containers:
+        - name: alienbank
+          image: alienbank:0.2.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: alienbank-config
+            - secretRef:
+                name: alienbank-secrets
+          volumeMounts:
+            - name: data
+              mountPath: /app/data
+          readinessProbe:
+            httpGet:
+              path: /login
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /login
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+      volumes:
+        # Ephemeral: SQLite DB + chroma index are seeded fresh on each start.
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alienbank
+  namespace: alienbank
+spec:
+  selector:
+    app: alienbank
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: alienbank
+  namespace: alienbank
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "120"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "120"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: alienbank.localtest.me
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: alienbank
+                port:
+                  name: http

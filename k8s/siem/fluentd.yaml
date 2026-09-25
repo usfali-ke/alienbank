@@ -1,0 +1,209 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fluentd
+  namespace: siem
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: fluentd
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "namespaces"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: fluentd
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: fluentd
+subjects:
+  - kind: ServiceAccount
+    name: fluentd
+    namespace: siem
+---
+# Fluentd pipeline config. Mounted over the image's /fluentd/etc/fluent.conf.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fluentd-config
+  namespace: siem
+data:
+  fluent.conf: |
+    # --- Ingest: tail every container's stdout (kind/containerd = CRI format) ---
+    <source>
+      @type tail
+      @id in_tail_container_logs
+      path /var/log/containers/*.log
+      pos_file /var/log/fluentd-containers.log.pos
+      tag kube.*
+      read_from_head true
+      <parse>
+        # CRI log line: "<time> <stream> <F|P> <message>"
+        @type cri
+      </parse>
+    </source>
+
+    # --- Enrich with pod/namespace/labels ---
+    <filter kube.**>
+      @type kubernetes_metadata
+      @id filter_kube_metadata
+    </filter>
+
+    # --- Keep only AlienBank app logs; everything else is dropped ---
+    <filter kube.**>
+      @type grep
+      <regexp>
+        key $.kubernetes.labels.app
+        pattern /^alienbank$/
+      </regexp>
+    </filter>
+
+    # --- Split security JSON events from plain uvicorn/app lines ---
+    # Security events are a complete JSON object emitted as the whole message.
+    # Re-tag those to `alienbank.security`; leave the rest as `alienbank.app`.
+    <match kube.**>
+      @type rewrite_tag_filter
+      <rule>
+        key message
+        pattern /^\{.*\}$/
+        tag alienbank.security
+      </rule>
+      <rule>
+        key message
+        pattern /.+/
+        tag alienbank.app
+      </rule>
+    </match>
+
+    # --- Parse the security JSON message into structured fields ---
+    <filter alienbank.security>
+      @type parser
+      key_name message
+      reserve_data true
+      remove_key_name_field true
+      <parse>
+        @type json
+      </parse>
+    </filter>
+
+    # Stamp when the SIEM shipper saw the line (string, not a Time object —
+    # msgpack can't serialize Time). The event's own @timestamp is preserved.
+    <filter alienbank.security>
+      @type record_transformer
+      enable_ruby true
+      <record>
+        siem_ingest_time ${time.strftime('%Y-%m-%dT%H:%M:%S%z')}
+      </record>
+    </filter>
+
+    # --- Output: security events -> alienbank-security-YYYY.MM.DD ---
+    <match alienbank.security>
+      @type opensearch
+      @id out_os_security
+      host opensearch
+      port 9200
+      scheme http
+      logstash_format true
+      logstash_prefix alienbank-security
+      include_timestamp true
+      time_key @timestamp
+      suppress_type_name true
+      <buffer>
+        @type file
+        path /var/log/fluentd-buffers/security.buffer
+        flush_mode interval
+        flush_interval 5s
+        retry_type exponential_backoff
+        retry_forever true
+        chunk_limit_size 8M
+      </buffer>
+    </match>
+
+    # --- Output: everything else (access/app logs) -> alienbank-app-* ---
+    <match alienbank.app>
+      @type opensearch
+      @id out_os_app
+      host opensearch
+      port 9200
+      scheme http
+      logstash_format true
+      logstash_prefix alienbank-app
+      suppress_type_name true
+      <buffer>
+        @type file
+        path /var/log/fluentd-buffers/app.buffer
+        flush_mode interval
+        flush_interval 5s
+        retry_type exponential_backoff
+        retry_forever true
+        chunk_limit_size 8M
+      </buffer>
+    </match>
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fluentd
+  namespace: siem
+  labels:
+    app: fluentd
+spec:
+  selector:
+    matchLabels:
+      app: fluentd
+  template:
+    metadata:
+      labels:
+        app: fluentd
+    spec:
+      serviceAccountName: fluentd
+      tolerations:
+        # Ship logs from control-plane nodes too (kind's only node is one).
+        - key: node-role.kubernetes.io/control-plane
+          effect: NoSchedule
+      containers:
+        - name: fluentd
+          image: fluent/fluentd-kubernetes-daemonset:v1.16-debian-opensearch-2
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: FLUENT_OPENSEARCH_HOST
+              value: opensearch
+            - name: FLUENT_OPENSEARCH_PORT
+              value: "9200"
+            - name: FLUENT_OPENSEARCH_SCHEME
+              value: http
+            # Our ConfigMap owns the full pipeline; disable the image's default systemd input.
+            - name: FLUENTD_SYSTEMD_CONF
+              value: disable
+          resources:
+            requests:
+              cpu: 100m
+              memory: 200Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          volumeMounts:
+            - name: config
+              mountPath: /fluentd/etc/fluent.conf
+              subPath: fluent.conf
+            - name: varlog
+              mountPath: /var/log
+            - name: varlibdockercontainers
+              mountPath: /var/lib/docker/containers
+              readOnly: true
+      terminationGracePeriodSeconds: 30
+      volumes:
+        - name: config
+          configMap:
+            name: fluentd-config
+        - name: varlog
+          hostPath:
+            path: /var/log
+        - name: varlibdockercontainers
+          hostPath:
+            path: /var/lib/docker/containers

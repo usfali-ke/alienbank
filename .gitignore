@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+data/*.db
+data/chroma/
+data/audit.jsonl
+.playwright-mcp/
+*.png
+!screenshots/*.png

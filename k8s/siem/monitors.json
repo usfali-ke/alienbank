@@ -1,0 +1,570 @@
+[
+  {
+    "type": "monitor",
+    "monitor_type": "bucket_level_monitor",
+    "name": "AlienBank \u2014 Brute force (single account)",
+    "enabled": true,
+    "schedule": {
+      "period": {
+        "interval": 1,
+        "unit": "MINUTES"
+      }
+    },
+    "inputs": [
+      {
+        "search": {
+          "indices": [
+            "alienbank-security-*"
+          ],
+          "query": {
+            "size": 0,
+            "query": {
+              "bool": {
+                "filter": [
+                  {
+                    "range": {
+                      "@timestamp": {
+                        "gte": "now-10m",
+                        "lte": "now",
+                        "format": "epoch_millis||strict_date_optional_time"
+                      }
+                    }
+                  },
+                  {
+                    "term": {
+                      "event.action.keyword": "login"
+                    }
+                  },
+                  {
+                    "term": {
+                      "event.outcome.keyword": "failure"
+                    }
+                  }
+                ]
+              }
+            },
+            "aggregations": {
+              "composite_agg": {
+                "composite": {
+                  "sources": [
+                    {
+                      "grp": {
+                        "terms": {
+                          "field": "target_ref.keyword"
+                        }
+                      }
+                    }
+                  ],
+                  "size": 50
+                },
+                "aggregations": {}
+              }
+            }
+          }
+        }
+      }
+    ],
+    "triggers": [
+      {
+        "bucket_level_trigger": {
+          "name": "AlienBank \u2014 Brute force (single account) \u2014 threshold",
+          "severity": "2",
+          "condition": {
+            "buckets_path": {
+              "bucket_count": "_count"
+            },
+            "parent_bucket_path": "composite_agg",
+            "script": {
+              "source": "params.bucket_count >= 5",
+              "lang": "painless"
+            }
+          },
+          "actions": []
+        }
+      }
+    ]
+  },
+  {
+    "type": "monitor",
+    "monitor_type": "bucket_level_monitor",
+    "name": "AlienBank \u2014 Credential spraying (one source, many accounts)",
+    "enabled": true,
+    "schedule": {
+      "period": {
+        "interval": 1,
+        "unit": "MINUTES"
+      }
+    },
+    "inputs": [
+      {
+        "search": {
+          "indices": [
+            "alienbank-security-*"
+          ],
+          "query": {
+            "size": 0,
+            "query": {
+              "bool": {
+                "filter": [
+                  {
+                    "range": {
+                      "@timestamp": {
+                        "gte": "now-10m",
+                        "lte": "now",
+                        "format": "epoch_millis||strict_date_optional_time"
+                      }
+                    }
+                  },
+                  {
+                    "term": {
+                      "event.action.keyword": "login"
+                    }
+                  },
+                  {
+                    "term": {
+                      "event.outcome.keyword": "failure"
+                    }
+                  }
+                ]
+              }
+            },
+            "aggregations": {
+              "composite_agg": {
+                "composite": {
+                  "sources": [
+                    {
+                      "grp": {
+                        "terms": {
+                          "field": "source.ip.keyword"
+                        }
+                      }
+                    }
+                  ],
+                  "size": 50
+                },
+                "aggregations": {
+                  "distinct": {
+                    "cardinality": {
+                      "field": "target_ref.keyword"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    ],
+    "triggers": [
+      {
+        "bucket_level_trigger": {
+          "name": "AlienBank \u2014 Credential spraying (one source, many accounts) \u2014 threshold",
+          "severity": "2",
+          "condition": {
+            "buckets_path": {
+              "distinct": "distinct"
+            },
+            "parent_bucket_path": "composite_agg",
+            "script": {
+              "source": "params.distinct >= 5",
+              "lang": "painless"
+            }
+          },
+          "actions": []
+        }
+      }
+    ]
+  },
+  {
+    "type": "monitor",
+    "monitor_type": "query_level_monitor",
+    "name": "AlienBank \u2014 Auth throttle tripped",
+    "enabled": true,
+    "schedule": {
+      "period": {
+        "interval": 1,
+        "unit": "MINUTES"
+      }
+    },
+    "inputs": [
+      {
+        "search": {
+          "indices": [
+            "alienbank-security-*"
+          ],
+          "query": {
+            "size": 0,
+            "query": {
+              "bool": {
+                "filter": [
+                  {
+                    "range": {
+                      "@timestamp": {
+                        "gte": "now-10m",
+                        "lte": "now",
+                        "format": "epoch_millis||strict_date_optional_time"
+                      }
+                    }
+                  },
+                  {
+                    "term": {
+                      "event.action.keyword": "login_throttle"
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        }
+      }
+    ],
+    "triggers": [
+      {
+        "query_level_trigger": {
+          "name": "AlienBank \u2014 Auth throttle tripped \u2014 present",
+          "severity": "1",
+          "condition": {
+            "script": {
+              "source": "ctx.results[0].hits.total.value >= 1",
+              "lang": "painless"
+            }
+          },
+          "actions": []
+        }
+      }
+    ]
+  },
+  {
+    "type": "monitor",
+    "monitor_type": "query_level_monitor",
+    "name": "AlienBank \u2014 IDOR/BOLA probing",
+    "enabled": true,
+    "schedule": {
+      "period": {
+        "interval": 1,
+        "unit": "MINUTES"
+      }
+    },
+    "inputs": [
+      {
+        "search": {
+          "indices": [
+            "alienbank-security-*"
+          ],
+          "query": {
+            "size": 0,
+            "query": {
+              "bool": {
+                "filter": [
+                  {
+                    "range": {
+                      "@timestamp": {
+                        "gte": "now-10m",
+                        "lte": "now",
+                        "format": "epoch_millis||strict_date_optional_time"
+                      }
+                    }
+                  },
+                  {
+                    "bool": {
+                      "should": [
+                        {
+                          "term": {
+                            "security.cross_tenant": true
+                          }
+                        },
+                        {
+                          "bool": {
+                            "filter": [
+                              {
+                                "term": {
+                                  "event.category.keyword": "data_access"
+                                }
+                              },
+                              {
+                                "term": {
+                                  "event.outcome.keyword": "blocked"
+                                }
+                              }
+                            ]
+                          }
+                        }
+                      ],
+                      "minimum_should_match": 1
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        }
+      }
+    ],
+    "triggers": [
+      {
+        "query_level_trigger": {
+          "name": "AlienBank \u2014 IDOR/BOLA probing \u2014 present",
+          "severity": "2",
+          "condition": {
+            "script": {
+              "source": "ctx.results[0].hits.total.value >= 1",
+              "lang": "painless"
+            }
+          },
+          "actions": []
+        }
+      }
+    ]
+  },
+  {
+    "type": "monitor",
+    "monitor_type": "query_level_monitor",
+    "name": "AlienBank \u2014 Guardrail evasion (bypassed layers)",
+    "enabled": true,
+    "schedule": {
+      "period": {
+        "interval": 1,
+        "unit": "MINUTES"
+      }
+    },
+    "inputs": [
+      {
+        "search": {
+          "indices": [
+            "alienbank-security-*"
+          ],
+          "query": {
+            "size": 0,
+            "query": {
+              "bool": {
+                "filter": [
+                  {
+                    "range": {
+                      "@timestamp": {
+                        "gte": "now-10m",
+                        "lte": "now",
+                        "format": "epoch_millis||strict_date_optional_time"
+                      }
+                    }
+                  },
+                  {
+                    "term": {
+                      "security.attack": true
+                    }
+                  },
+                  {
+                    "exists": {
+                      "field": "security.bypassed_layers"
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        }
+      }
+    ],
+    "triggers": [
+      {
+        "query_level_trigger": {
+          "name": "AlienBank \u2014 Guardrail evasion (bypassed layers) \u2014 present",
+          "severity": "2",
+          "condition": {
+            "script": {
+              "source": "ctx.results[0].hits.total.value >= 1",
+              "lang": "painless"
+            }
+          },
+          "actions": []
+        }
+      }
+    ]
+  },
+  {
+    "type": "monitor",
+    "monitor_type": "query_level_monitor",
+    "name": "AlienBank \u2014 Agent compromise",
+    "enabled": true,
+    "schedule": {
+      "period": {
+        "interval": 1,
+        "unit": "MINUTES"
+      }
+    },
+    "inputs": [
+      {
+        "search": {
+          "indices": [
+            "alienbank-security-*"
+          ],
+          "query": {
+            "size": 0,
+            "query": {
+              "bool": {
+                "filter": [
+                  {
+                    "range": {
+                      "@timestamp": {
+                        "gte": "now-10m",
+                        "lte": "now",
+                        "format": "epoch_millis||strict_date_optional_time"
+                      }
+                    }
+                  },
+                  {
+                    "term": {
+                      "event.category.keyword": "agent_turn"
+                    }
+                  },
+                  {
+                    "term": {
+                      "event.outcome.keyword": "compromise"
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        }
+      }
+    ],
+    "triggers": [
+      {
+        "query_level_trigger": {
+          "name": "AlienBank \u2014 Agent compromise \u2014 present",
+          "severity": "1",
+          "condition": {
+            "script": {
+              "source": "ctx.results[0].hits.total.value >= 1",
+              "lang": "painless"
+            }
+          },
+          "actions": []
+        }
+      }
+    ]
+  },
+  {
+    "type": "monitor",
+    "monitor_type": "query_level_monitor",
+    "name": "AlienBank \u2014 Prompt/canary leak",
+    "enabled": true,
+    "schedule": {
+      "period": {
+        "interval": 1,
+        "unit": "MINUTES"
+      }
+    },
+    "inputs": [
+      {
+        "search": {
+          "indices": [
+            "alienbank-security-*"
+          ],
+          "query": {
+            "size": 0,
+            "query": {
+              "bool": {
+                "filter": [
+                  {
+                    "range": {
+                      "@timestamp": {
+                        "gte": "now-10m",
+                        "lte": "now",
+                        "format": "epoch_millis||strict_date_optional_time"
+                      }
+                    }
+                  },
+                  {
+                    "term": {
+                      "security.canary_leak": true
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        }
+      }
+    ],
+    "triggers": [
+      {
+        "query_level_trigger": {
+          "name": "AlienBank \u2014 Prompt/canary leak \u2014 present",
+          "severity": "1",
+          "condition": {
+            "script": {
+              "source": "ctx.results[0].hits.total.value >= 1",
+              "lang": "painless"
+            }
+          },
+          "actions": []
+        }
+      }
+    ]
+  },
+  {
+    "type": "monitor",
+    "monitor_type": "query_level_monitor",
+    "name": "AlienBank \u2014 Privilege escalation (non-teller on teller endpoint)",
+    "enabled": true,
+    "schedule": {
+      "period": {
+        "interval": 1,
+        "unit": "MINUTES"
+      }
+    },
+    "inputs": [
+      {
+        "search": {
+          "indices": [
+            "alienbank-security-*"
+          ],
+          "query": {
+            "size": 0,
+            "query": {
+              "bool": {
+                "filter": [
+                  {
+                    "range": {
+                      "@timestamp": {
+                        "gte": "now-10m",
+                        "lte": "now",
+                        "format": "epoch_millis||strict_date_optional_time"
+                      }
+                    }
+                  },
+                  {
+                    "term": {
+                      "event.action.keyword": "teller_customer_accounts"
+                    }
+                  },
+                  {
+                    "term": {
+                      "event.outcome.keyword": "blocked"
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        }
+      }
+    ],
+    "triggers": [
+      {
+        "query_level_trigger": {
+          "name": "AlienBank \u2014 Privilege escalation (non-teller on teller endpoint) \u2014 present",
+          "severity": "2",
+          "condition": {
+            "script": {
+              "source": "ctx.results[0].hits.total.value >= 1",
+              "lang": "painless"
+            }
+          },
+          "actions": []
+        }
+      }
+    ]
+  }
+]

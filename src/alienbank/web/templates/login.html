@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AlienBank — Sign in</title>
+  <link rel="stylesheet" href="/static/css/app.css" />
+</head>
+<body class="login-bg">
+  <div class="login-card">
+    <div class="brand">
+      <span class="brand-mark">🛸</span>
+      <span class="brand-name">ALIEN<span>BANK</span></span>
+    </div>
+    <h1>Welcome back</h1>
+    <p class="muted">Sign in to your account</p>
+
+    {% if error %}<div class="alert">{{ error }}</div>{% endif %}
+
+    <form method="post" action="/login">
+      <label>Username
+        <input name="username" autocomplete="username" required autofocus />
+      </label>
+      <label>Password
+        <input name="password" type="password" autocomplete="current-password" required />
+      </label>
+      <button type="submit" class="btn-primary">Sign in</button>
+    </form>
+
+    <div class="demo-creds">
+      <strong>Demo logins</strong>
+      <ul>
+        <li>Customer — <code>ana</code> / <code>ana123</code></li>
+        <li>Customer — <code>brenda</code> / <code>brenda123</code></li>
+        <li>Teller — <code>teller</code> / <code>teller123</code></li>
+      </ul>
+    </div>
+  </div>
+</body>
+</html>

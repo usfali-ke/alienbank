@@ -1,0 +1,32 @@
+[project]
+name = "alienbank"
+version = "0.2.0"
+description = "AlienBank — a security lab banking app: hardened REST API, deliberately prompt-injectable chat agent."
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "jinja2>=3.1",
+    "python-multipart>=0.0.9",
+    "itsdangerous>=2.2",
+    "python-dotenv>=1.0.1",
+    "openai>=1.40",
+    "openai-agents>=0.0.10",
+    "pydantic>=2.7",
+    "chromadb>=0.5",
+]
+
+[project.scripts]
+alienbank = "alienbank.__main__:main"
+alienbank-demo = "alienbank.exploit_demo:main"
+alienbank-bench = "alienbank.benchmark:main"
+alienbank-index = "alienbank.agent.knowledge:main"
+alienbank-audit = "alienbank.agent.audit:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/alienbank"]

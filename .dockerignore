@@ -1,0 +1,28 @@
+# Secrets — never bake into the image (injected via k8s Secret instead)
+.env
+.env.*
+!.env.example
+
+# Local virtualenv & caches
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# Runtime data (seeded fresh in-container)
+data/
+knowledge/**/chroma/
+
+# Dev/demo artefacts
+.playwright-mcp/
+*.png
+!screenshots/*.png
+demo2/
+demo_record/
+screenshots/
+
+# VCS & editor
+.git/
+.gitignore
+.claude/
