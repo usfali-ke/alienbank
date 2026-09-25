@@ -1,0 +1,69 @@
+# Parsed by the security dashboard (G4 release approval). Keep the field
+# labels exactly as they are — the parser keys on the "### <label>"
+# headings GitHub renders. Approval is by label, applied by someone other
+# than the requester: change-approved, readiness-approved, client-approved
+# (when client approval is required), or change-rejected.
+name: Change request
+description: Request a release to an environment (referenced as CHG-<issue number> by devsecops-release)
+title: "CHG: "
+labels: [change]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Release with **Actions → devsecops-release → Run workflow**, passing this issue's number.
+        G4 approves only when this change carries `change-approved` and `readiness-approved`
+        (plus `client-approved` if ticked below), applied by someone other than you, and the
+        release falls inside the change window.
+  - type: dropdown
+    id: change_type
+    attributes:
+      label: Change type
+      options:
+        - Standard
+        - Normal
+        - Emergency
+    validations:
+      required: true
+  - type: input
+    id: window_start
+    attributes:
+      label: Change window start (UTC)
+      description: ISO-8601, e.g. 2026-10-01T09:00Z
+      placeholder: 2026-10-01T09:00Z
+    validations:
+      required: true
+  - type: input
+    id: window_end
+    attributes:
+      label: Change window end (UTC)
+      description: ISO-8601, e.g. 2026-10-01T11:00Z
+      placeholder: 2026-10-01T11:00Z
+    validations:
+      required: true
+  - type: checkboxes
+    id: readiness
+    attributes:
+      label: Readiness
+      options:
+        - label: Documentation complete
+        - label: Client approval required
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What changes, and why
+    validations:
+      required: true
+  - type: textarea
+    id: risk
+    attributes:
+      label: Risk and impact
+      description: Who is affected, and what could go wrong
+  - type: textarea
+    id: rollback
+    attributes:
+      label: Rollback plan
+      description: How the change is backed out (e.g. Argo Rollouts abort / revert the deploy commit)
+    validations:
+      required: true

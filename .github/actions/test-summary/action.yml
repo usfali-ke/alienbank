@@ -1,0 +1,35 @@
+name: Summarize test results
+description: >
+  Parses JUnit XML (and optionally a Cobertura coverage XML) into the
+  numbers the dashboard's QA-test-pass-rate and coverage metrics read
+  (tests_passed / tests_total / coverage_pct). Stdlib-only Python, so it
+  works on any runner image with python3.
+
+inputs:
+  junit-glob:
+    description: Glob for JUnit XML files, relative to the workspace
+    required: false
+    default: "**/junit*.xml"
+  coverage-file:
+    description: Cobertura XML path (optional)
+    required: false
+    default: ""
+
+outputs:
+  tests-passed:
+    value: ${{ steps.parse.outputs.tests_passed }}
+  tests-total:
+    value: ${{ steps.parse.outputs.tests_total }}
+  coverage-pct:
+    description: Line coverage %, empty if no coverage file was found
+    value: ${{ steps.parse.outputs.coverage_pct }}
+
+runs:
+  using: composite
+  steps:
+    - id: parse
+      shell: bash
+      env:
+        JUNIT_GLOB: ${{ inputs.junit-glob }}
+        COVERAGE_FILE: ${{ inputs.coverage-file }}
+      run: python3 "${GITHUB_ACTION_PATH}/summary.py"

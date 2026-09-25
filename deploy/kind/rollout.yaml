@@ -1,0 +1,106 @@
+# Progressive delivery: half the replicas move to the new digest, the
+# AnalysisTemplate probes the canary, and only a passing analysis promotes
+# to 100%. A failed analysis aborts and scales the canary back to stable.
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: alienbank
+  labels:
+    app: alienbank
+  annotations:
+    # Accepted, documented exceptions to the G2 iac_clean checkov scan:
+    checkov.io/skip1: CKV_K8S_35=The app reads ALIENBANK_SECRET_KEY and provider keys from env only; file-mounted secrets need an app change (tracked in README)
+    checkov.io/skip2: CKV2_K8S_6=No NetworkPolicy yet; enforcement by the kind CNI and the ingress/argo-rollouts source namespaces are unverified (tracked in README)
+spec:
+  replicas: 2
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app: alienbank
+      delivery: gitops
+  strategy:
+    canary:
+      canaryService: alienbank-canary
+      stableService: alienbank-stable
+      steps:
+        - setWeight: 50
+        - analysis:
+            templates:
+              - templateName: alienbank-canary-health
+        - setWeight: 100
+  template:
+    metadata:
+      labels:
+        app: alienbank
+        delivery: gitops
+    spec:
+      imagePullSecrets:
+        # docker-registry secret for ghcr.io, created cluster-side (the
+        # package is private). Not in git.
+        - name: ghcr-pull
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: alienbank
+          # Kustomize `images:` rewrites this to ghcr.io/...@sha256:<digest>.
+          image: alienbank
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: alienbank-config
+            # ALIENBANK_SECRET_KEY and provider credentials, created
+            # cluster-side. Not in git.
+            - secretRef:
+                name: alienbank-secrets
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          # The app writes only to /app/data (SQLite, chroma, audit log);
+          # /tmp and $HOME/.cache cover Python/library scratch files.
+          volumeMounts:
+            - name: data
+              mountPath: /app/data
+            - name: tmp
+              mountPath: /tmp
+            - name: cache
+              mountPath: /app/.cache
+          readinessProbe:
+            httpGet:
+              path: /login
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /login
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+      volumes:
+        - name: data
+          emptyDir: {}
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi
+        - name: cache
+          emptyDir:
+            sizeLimit: 256Mi

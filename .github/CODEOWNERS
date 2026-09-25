@@ -1,0 +1,4 @@
+# Gate definitions and the GitOps source need the owner's review. Enforced
+# only when a branch ruleset requires code-owner review.
+/.github/ @usfali-ke
+/deploy/ @usfali-ke

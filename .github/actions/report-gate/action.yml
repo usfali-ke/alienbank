@@ -1,0 +1,109 @@
+name: Report gate evaluation
+description: >
+  Records one control-gate decision as the workflow artifact
+  `gate-result-<GATE>` (gate-result.json, a GateEvaluationIn body — see the
+  security dashboard's docs/GATE_INGEST_API.md). GitHub-hosted runners
+  can't reach the dashboard, so it PULLS these artifacts (its GitHub
+  collector) instead of the runner pushing them. The gate itself is
+  enforced by the calling job's exit code; this only records what was
+  decided.
+
+inputs:
+  gate:
+    description: G1..G7 or OPERATE
+    required: true
+  status:
+    description: pass | fail — the decision this gate actually made
+    required: true
+  subject:
+    description: What was evaluated (pr-123, commit SHA, image digest). Re-evaluating the same subject after a fail counts as rework.
+    required: true
+  criteria-json:
+    description: JSON array of {key, status, category, detail, metrics}
+    required: true
+  commit-sha:
+    required: false
+    default: ""
+  artifact-digest:
+    required: false
+    default: ""
+  environment:
+    required: false
+    default: ""
+  started-at:
+    description: ISO-8601 start time of the gate; defaults to now
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Build gate-result.json
+      id: build
+      shell: bash
+      # Every value arrives via env, never ${{ }} inside the script, so a
+      # crafted branch name or criterion detail can't inject shell.
+      env:
+        IN_GATE: ${{ inputs.gate }}
+        IN_STATUS: ${{ inputs.status }}
+        IN_SUBJECT: ${{ inputs.subject }}
+        IN_CRITERIA: ${{ inputs.criteria-json }}
+        IN_COMMIT: ${{ inputs.commit-sha }}
+        IN_DIGEST: ${{ inputs.artifact-digest }}
+        IN_ENV: ${{ inputs.environment }}
+        IN_STARTED_AT: ${{ inputs.started-at }}
+      run: |
+        set -euo pipefail
+        out_dir="${RUNNER_TEMP}/gate-result-${IN_GATE}"
+        mkdir -p "$out_dir"
+        python3 - "$out_dir/gate-result.json" <<'PY'
+        import datetime as dt, json, os, re, sys
+
+        def opt(name):
+            v = os.environ.get(name, "").strip()
+            return v or None
+
+        gate = os.environ["IN_GATE"]
+        if not re.fullmatch(r"G[1-7]|OPERATE", gate):
+            sys.exit(f"gate must be G1..G7 or OPERATE, got {gate!r}")
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        body = {
+            # The dashboard overwrites product/source/run_url from the run it
+            # downloaded this from; they're here so the file reads standalone.
+            "product": "alienbank",
+            "gate": gate,
+            "status": os.environ["IN_STATUS"],
+            "source": "github-actions",
+            "subject": os.environ["IN_SUBJECT"],
+            "external_id": f"gh-{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}-{gate}",
+            "commit_sha": opt("IN_COMMIT") or os.environ.get("GITHUB_SHA"),
+            "artifact_digest": opt("IN_DIGEST"),
+            "environment": opt("IN_ENV"),
+            "run_url": f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+            "started_at": opt("IN_STARTED_AT") or now,
+            "finished_at": now,
+            "criteria": json.loads(os.environ["IN_CRITERIA"]),
+        }
+        for c in body["criteria"]:
+            # The API caps detail at 1000 chars; a long tool message must
+            # not turn into a 422 that loses the whole evaluation.
+            if isinstance(c.get("detail"), str):
+                c["detail"] = c["detail"][:1000]
+        if body["status"] not in ("pass", "fail"):
+            sys.exit(f"status must be pass|fail, got {body['status']!r}")
+        with open(sys.argv[1], "w") as f:
+            json.dump(body, f, indent=2)
+        with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+            f.write(f"### {gate}: {body['status']}\n\n")
+            for c in body["criteria"]:
+                f.write(f"- **{c.get('status')}** `{c.get('key')}` — {c.get('detail', '')}\n")
+        PY
+        echo "dir=$out_dir" >> "$GITHUB_OUTPUT"
+    - name: Upload gate-result-${{ inputs.gate }}
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: gate-result-${{ inputs.gate }}
+        path: ${{ steps.build.outputs.dir }}/gate-result.json
+        overwrite: true
+        retention-days: 30
+        if-no-files-found: error

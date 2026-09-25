@@ -1,0 +1,274 @@
+# G1 — Merge only if: required reviewers approved AND unit tests pass AND
+# SAST/secret scan clean of Critical/High AND commits signed.
+#
+# Each check job always succeeds and publishes a status output; only the
+# final `gate` job decides, and it records the decision as the artifact
+# `gate-result-G1`, which the security dashboard pulls. Mark "G1 merge gate"
+# as the required status check in a branch ruleset to make "merge only if"
+# true — without that, a red G1 is advisory.
+#
+# Evidence integrity: the dashboard ignores this artifact when the PR
+# itself changes .github/ (a PR could otherwise rewrite this file to report
+# a pass); those PRs are judged again once merged.
+#
+# GitHub never lets an author approve their own PR, and approvals from the
+# PR author are excluded here too — a solo maintainer's PRs fail
+# required_reviewers_approved. That's the control working, not a bug.
+
+name: devsecops-pr
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  pull_request_review:
+    types: [submitted, dismissed]
+
+permissions: {}
+
+concurrency:
+  group: devsecops-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  PR_NUMBER: ${{ github.event.pull_request.number }}
+  REQUIRED_APPROVALS: "1"
+
+jobs:
+  reviewers:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    outputs:
+      status: ${{ steps.check.outputs.status }}
+      detail: ${{ steps.check.outputs.detail }}
+      approvals: ${{ steps.check.outputs.approvals }}
+    steps:
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/reviews" --jq '.[] | tojson' > reviews.jsonl
+          python3 - <<'PY'
+          import json, os
+          reviews = [json.loads(line) for line in open("reviews.jsonl") if line.strip()]
+          author, head = os.environ["AUTHOR"], os.environ["HEAD_SHA"]
+          latest = {}
+          for r in reviews:  # chronological; the last state per reviewer wins
+              if r["user"]["login"] == author or r["state"] in ("COMMENTED", "PENDING"):
+                  continue
+              latest[r["user"]["login"]] = r
+          # Only approvals of the current head count — an approval of an
+          # older revision didn't review what's actually being merged.
+          approvals = sorted(u for u, r in latest.items() if r["state"] == "APPROVED" and r["commit_id"] == head)
+          blocking = sorted(u for u, r in latest.items() if r["state"] == "CHANGES_REQUESTED")
+          required = int(os.environ["REQUIRED_APPROVALS"])
+          ok = len(approvals) >= required and not blocking
+          detail = f"{len(approvals)} of {required} required approval(s) on head {head[:7]} (author {author} excluded)"
+          if blocking:
+              detail += f"; changes requested by {', '.join(blocking)}"
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"status={'pass' if ok else 'fail'}\ndetail={detail}\napprovals={len(approvals)}\n")
+          print(detail)
+          PY
+
+  unit-tests:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      status: ${{ steps.result.outputs.status }}
+      passed: ${{ steps.summary.outputs.tests-passed }}
+      total: ${{ steps.summary.outputs.tests-total }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.12.19"
+      - id: run
+        run: |
+          rc=0
+          uv sync --frozen --group dev || rc=$?
+          [ "$rc" = 0 ] && { uv run --frozen pytest tests/unit --junitxml=junit-unit.xml || rc=$?; }
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+      - id: summary
+        uses: ./.github/actions/test-summary
+        with:
+          junit-glob: junit-unit.xml
+      - id: result
+        env:
+          RC: ${{ steps.run.outputs.rc }}
+          TOTAL: ${{ steps.summary.outputs.tests-total }}
+          PASSED: ${{ steps.summary.outputs.tests-passed }}
+        # Zero discovered tests is a fail, not a vacuous pass.
+        run: |
+          if [ "$RC" = "0" ] && [ "${TOTAL:-0}" -gt 0 ] && [ "$PASSED" = "$TOTAL" ]; then s=pass; else s=fail; fi
+          echo "status=$s" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: junit-unit
+          path: junit-unit.xml
+          if-no-files-found: ignore
+
+  sast:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    container:
+      image: semgrep/semgrep:1.178.0
+    outputs:
+      status: ${{ steps.scan.outputs.status }}
+      detail: ${{ steps.scan.outputs.detail }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: scan
+        run: |
+          semgrep scan --config p/default --config p/python --json --output semgrep.json --metrics=off || true
+          python3 - <<'PY'
+          import json, os
+          out = open(os.environ["GITHUB_OUTPUT"], "a")
+          try:
+              results = json.load(open("semgrep.json")).get("results", [])
+          except (OSError, ValueError):
+              out.write("status=fail\ndetail=semgrep did not complete\n")
+              raise SystemExit
+          # Semgrep's ERROR level is its High/Critical tier.
+          blocking = [r for r in results if r["extra"].get("severity") == "ERROR"]
+          rules = ", ".join(sorted({r["check_id"].rsplit(".", 1)[-1] for r in blocking})[:6])
+          out.write(f"status={'fail' if blocking else 'pass'}\n")
+          out.write(f"detail={len(blocking)} Critical/High of {len(results)} findings (semgrep p/default + p/python){': ' + rules if rules else ''}\n")
+          PY
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: scan-semgrep
+          path: semgrep.json
+          if-no-files-found: ignore
+
+  secrets:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      status: ${{ steps.scan.outputs.status }}
+      detail: ${{ steps.scan.outputs.detail }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: scan
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        # Scans only the commits this PR introduces — a secret anywhere in
+        # them is a leak even if a later commit deletes it.
+        run: |
+          rc=0
+          docker run --rm -v "$PWD:/repo" -w /repo ghcr.io/gitleaks/gitleaks:v8.30.1 \
+            git --log-opts="${BASE_SHA}..${HEAD_SHA}" --report-format json --report-path /repo/gitleaks.json \
+            --exit-code 0 --redact /repo || rc=$?
+          if [ "$rc" != 0 ] || [ ! -f gitleaks.json ]; then
+            printf 'status=fail\ndetail=gitleaks did not complete\n' >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          n=$(python3 -c 'import json; print(len(json.load(open("gitleaks.json")) or []))')
+          if [ "$n" = "0" ]; then echo "status=pass" >> "$GITHUB_OUTPUT"; else echo "status=fail" >> "$GITHUB_OUTPUT"; fi
+          echo "detail=${n} leak(s) in ${BASE_SHA:0:7}..${HEAD_SHA:0:7} (gitleaks)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: scan-gitleaks
+          path: gitleaks.json
+          if-no-files-found: ignore
+
+  commits-signed:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    outputs:
+      status: ${{ steps.check.outputs.status }}
+      detail: ${{ steps.check.outputs.detail }}
+    steps:
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # GitHub's own verification verdict (GPG/SSH/S/MIME signature by a
+        # key registered to the committer) — not just "has a signature".
+        run: |
+          set -euo pipefail
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/commits" \
+            --jq '.[] | [.sha[0:7], (.commit.verification.verified|tostring), .commit.verification.reason] | @tsv' > commits.tsv
+          total=$(wc -l < commits.tsv); unsigned=$(awk -F'\t' '$2!="true"' commits.tsv | wc -l)
+          awk -F'\t' '$2!="true"{print "unverified: "$1" ("$3")"}' commits.tsv
+          if [ "$unsigned" -eq 0 ] && [ "$total" -gt 0 ]; then echo "status=pass" >> "$GITHUB_OUTPUT"; else echo "status=fail" >> "$GITHUB_OUTPUT"; fi
+          echo "detail=${unsigned} of ${total} commit(s) unsigned/unverified" >> "$GITHUB_OUTPUT"
+
+  gate:
+    name: G1 merge gate
+    needs: [reviewers, unit-tests, sast, secrets, commits-signed]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
+      - id: assemble
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          needs = json.loads(os.environ["NEEDS"])
+
+          def out(job, key, default=""):
+              return (needs.get(job, {}).get("outputs") or {}).get(key) or default
+
+          def crit(key, job, category, detail, metrics=None):
+              status = out(job, "status")
+              if status not in ("pass", "fail"):
+                  # The job crashed/was cancelled before deciding — that's a
+                  # fail, never an implicit pass.
+                  status, detail = "fail", f"check did not complete (job result: {needs.get(job, {}).get('result')})"
+              c = {"key": key, "status": status, "category": category, "detail": detail}
+              if metrics:
+                  c["metrics"] = metrics
+              return c
+
+          passed, total = int(out("unit-tests", "passed", "0") or 0), int(out("unit-tests", "total", "0") or 0)
+          criteria = [
+              crit("required_reviewers_approved", "reviewers", "governance", out("reviewers", "detail"),
+                   {"approvals": int(out("reviewers", "approvals", "0") or 0), "required": int(os.environ["REQUIRED_APPROVALS"])}),
+              crit("unit_tests_pass", "unit-tests", "quality", f"{passed}/{total} passed (pytest tests/unit)",
+                   {"tests_passed": passed, "tests_total": total}),
+              crit("sast_clean", "sast", "security", out("sast", "detail")),
+              crit("secrets_clean", "secrets", "security", out("secrets", "detail")),
+              crit("commits_signed", "commits-signed", "security", out("commits-signed", "detail")),
+          ]
+          status = "pass" if all(c["status"] == "pass" for c in criteria) else "fail"
+          for c in criteria:
+              print(f"{c['status']:>4}  {c['key']}: {c['detail']}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"status={status}\ncriteria={json.dumps(criteria)}\n")
+          PY
+      - uses: ./.github/actions/report-gate
+        with:
+          gate: G1
+          status: ${{ steps.assemble.outputs.status }}
+          subject: pr-${{ github.event.pull_request.number }}
+          criteria-json: ${{ steps.assemble.outputs.criteria }}
+          commit-sha: ${{ github.event.pull_request.head.sha }}
+      - name: Enforce
+        if: steps.assemble.outputs.status != 'pass'
+        run: |
+          echo "::error::G1 merge gate failed — see criteria above"
+          exit 1

@@ -8,3 +8,6 @@ data/audit.jsonl
 .playwright-mcp/
 *.png
 !screenshots/*.png
+junit-*.xml
+coverage.xml
+.coverage

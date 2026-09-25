@@ -1,0 +1,13 @@
+# Non-secret runtime config — every parameter that changes from one environment
+# to another lives here, so moving between clusters/backends is a ConfigMap edit
+# (never an image rebuild). Only true secrets (Bedrock token, session key) live
+# in the `alienbank-secrets` Secret, created out-of-band from .env — see
+# k8s/README.md. Argo CD applies edits merged to main; pods read it at start,
+# so follow with `kubectl argo rollouts -n alienbank restart alienbank`.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alienbank-config
+  namespace: alienbank
+data:
+  # --- Web server 

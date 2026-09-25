@@ -1,0 +1,43 @@
+# `alienbank` selects every Rollout pod (stable + canary), so without a
+# traffic router the canary's share of Ingress traffic is its share of
+# replicas. Argo Rollouts adds the pod-template-hash selector to -stable /
+# -canary. `delivery: gitops` keeps the legacy k8s/deploy.yaml pods (label
+# app: alienbank only) out of these Services if both ever coexist.
+apiVersion: v1
+kind: Service
+metadata:
+  name: alienbank
+spec:
+  selector:
+    app: alienbank
+    delivery: gitops
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alienbank-stable
+spec:
+  selector:
+    app: alienbank
+    delivery: gitops
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alienbank-canary
+spec:
+  selector:
+    app: alienbank
+    delivery: gitops
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

@@ -1,0 +1,88 @@
+# Canary analysis — exactly two checks, matching the Argo CD Application's
+# dashboard.validations=functional,security_control. There is no
+# Prometheus/monitoring metric yet, so none is claimed. Both hit the canary
+# Service (canary pods only) and run in parallel for ~1 minute.
+#
+# functional (web provider): GET /login must answer 2xx. The web provider
+# treats non-2xx as a measurement error. Argo Rollouts v1.10.0 marks a 2xx
+# non-JSON body Successful without evaluating successCondition, so on v1.10
+# this asserts the status only. Upstream #4770 (unreleased as of
+# 2026-09) evaluates the condition against the body string, which makes the
+# login-form check below live. Releases before v1.10 error on non-JSON
+# bodies, so this needs Argo Rollouts >= v1.10.0.
+#
+# security_control (job provider): anonymous requests to protected routes
+# must be refused. The web provider can't assert this: every refusal is
+# non-2xx (a measurement error), and it silently follows the /dashboard →
+# /login redirect. So curl checks the exact codes without following
+# redirects, and any mismatch fails the Job, which fails the metric. The same
+# contract is pinned in tests/unit/test_canary_analysis.py.
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: alienbank-canary-health
+spec:
+  metrics:
+    - name: functional
+      interval: 20s
+      count: 3
+      failureLimit: 0
+      consecutiveErrorLimit: 1
+      successCondition: "result contains 'name=\"password\"'"
+      provider:
+        web:
+          url: http://alienbank-canary.alienbank.svc/login
+          timeoutSeconds: 10
+    - name: security-control
+      count: 1
+      failureLimit: 0
+      provider:
+        job:
+          spec:
+            backoffLimit: 0
+            activeDeadlineSeconds: 90
+            template:
+              spec:
+                restartPolicy: Never
+                automountServiceAccountToken: false
+                securityContext:
+                  runAsNonRoot: true
+                  runAsUser: 100
+                  runAsGroup: 101
+                  seccompProfile:
+                    type: RuntimeDefault
+                containers:
+                  - name: probe
+                    image: curlimages/curl:8.22.0@sha256:58adaa4e8dca9c988bae2aba4ab3434a0bb2da16bbe3f92dec39ec7785166777
+                    securityContext:
+                      allowPrivilegeEscalation: false
+                      readOnlyRootFilesystem: true
+                      capabilities:
+                        drop: ["ALL"]
+                    resources:
+                      requests:
+                        cpu: 10m
+                        memory: 16Mi
+                      limits:
+                        cpu: 100m
+                        memory: 64Mi
+                    env:
+                      - name: BASE
+                        value: http://alienbank-canary.alienbank.svc
+                    command: ["/bin/sh", "-c"]
+                    args:
+                      - |
+                        set -u
+                        fail=0
+                        expect() {  # method path want_code [want_location]
+                          got=$(curl -sS -o /dev/null --max-time 10 -X "$1" -w '%{http_code} %{redirect_url}' "$BASE$2") || got="curl-error"
+                          want="$3${4:+ $BASE$4}"
+                          if [ "${got% }" = "$want" ]; then echo "ok   $1 $2 -> $got"
+                          else echo "FAIL $1 $2 -> '$got', want '$want'"; fail=1; fi
+                        }
+                        expect GET  /api/me 401
+                        expect GET  /api/accounts 401
+                        expect GET  /api/accounts/0101700001/balance 401
+                        expect POST /api/transfer 401
+                        expect GET  /dashboard 307 /login
+                        exit $fail

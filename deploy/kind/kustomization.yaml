@@ -1,0 +1,23 @@
+# GitOps source of truth for the kind environment. Argo CD (app `alienbank`,
+# created cluster-side) syncs this directory with selfHeal; nothing else
+# writes to the namespace. The only automated edit is the image digest below,
+# committed by devsecops-release.yml (G5) after G4 approves a change.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: alienbank
+
+resources:
+  - configmap.yaml
+  - services.yaml
+  - ingress.yaml
+  - analysistemplate.yaml
+  - rollout.yaml
+
+images:
+  # TODO(first release): the all-zero digest is a placeholder — no image has
+  # been released yet, so the Rollout can't pull until the first
+  # devsecops-release run replaces it with a G2-signed digest. Never put a
+  # tag here: admission (Kyverno) requires digests.
+  - name: alienbank
+    newName: ghcr.io/usfali-ke/alienbank
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000

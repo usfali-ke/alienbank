@@ -349,6 +349,81 @@ only at L3 by **D4** — the exact payloads and the "why" per level are in
 
 ---
 
+## DevSecOps control gates
+
+Delivery goes through five gates. Each one records its decision for the
+security dashboard. The dashboard can't be reached from GitHub-hosted
+runners, so it **pulls**: every gate uploads a `gate-result-<GATE>` artifact
+(`.github/actions/report-gate`), and the dashboard's GitHub collector polls
+for them. It trusts only runs of `.github/workflows/devsecops-*.yml` from this
+repo, never from forks. It also ignores PR results when the PR changes
+`.github/` itself.
+
+| Gate | Workflow | Blocks on |
+|---|---|---|
+| G1 merge | `devsecops-pr.yml` | reviewer approval on the head commit (author excluded), unit tests, semgrep ERROR findings, gitleaks leaks in the PR's commits, unverified commit signatures |
+| G2 artifact | `devsecops-main.yml` | non-reproducible build or unpinned base images; fixable Critical/High in uv.lock or the image (Trivy); checkov failures on Dockerfile + `deploy/kind` render; image runs as root; no CycloneDX SBOM. The image is signed only when all of these pass |
+| G3 pre-prod | `devsecops-main.yml` | the G2 digest, run read-only: unit + integration tests; k6 p95 > 500 ms; coverage below the ratchet; ZAP baseline High alerts; Trivy KSV/Pod Security Standards findings on the render |
+| G4 release | `devsecops-release.yml` → dashboard | the dashboard decides, from the change request, approvals, change window and this digest's G2/G3 results, and answers with the commit status `security-dashboard/G4` |
+| G5 deploy | `devsecops-release.yml` | cosign `slsaprovenance1` and `gh attestation verify` for this commit; kubeconform-strict render; then a GitOps commit to `deploy/kind` that Argo CD syncs |
+
+**Releasing:** open a *Change request* issue, which becomes `CHG-<number>`.
+Someone other than the requester applies the labels. Then run **Actions →
+devsecops-release** on `main` with that number. The workflow uploads a
+`release-request` artifact and waits up to 20 minutes for the dashboard's
+G4 status. On approval, it commits the digest to
+`deploy/kind/kustomization.yaml` (with `[skip ci]`) and uploads a
+`deployment-event` with ID `deploy-kind-<gitops commit sha>`. Argo CD
+notifications update that event with the sync/canary outcome.
+
+**Canary:** the Argo Rollouts canary moves to 50%, runs the analysis, then
+100%. The analysis has exactly two checks: `functional` (web provider, GET
+`/login` must be 2xx) and `security-control` (a curl job; anonymous
+requests to `/api/*` must get 401 and `/dashboard` must redirect to
+`/login`). `tests/unit/test_canary_analysis.py` pins both against the app.
+There is no monitoring metric yet.
+
+**Labels to create:** `change`, `incident`, `change-approved`,
+`readiness-approved`, `client-approved`, `change-rejected`, `pir-required`,
+`pir-complete`.
+
+**Known limitations. These are deliberate or not done yet; don't read them
+as passes:**
+
+- *Solo maintainer:* GitHub never lets authors approve their own PRs, and G1
+  doesn't count the author. So with one maintainer, G1's
+  `required_reviewers_approved` fails. That's the control working.
+- *Enforcement* needs branch rulesets: "G1 merge gate" must be a required
+  check, with code-owner review for `.github/` and `deploy/`
+  (`.github/CODEOWNERS`). G5 pushes to `main` with `GITHUB_TOKEN`, so the
+  ruleset has to allow GitHub Actions to bypass it for that push.
+  Otherwise G5's `approved_gitops_pipeline_path` fails.
+- *Placeholder digest:* `deploy/kind` points at an all-zero digest until
+  the first release, so the Rollout can't pull anything before then.
+- *cosign v2.6.5* is used on purpose, because it writes the `.sig`/`.att`
+  tags that Kyverno verifies in kind. cosign v3 defaults to the bundle
+  format.
+- *Reproducibility* is measured, not assumed. G2 builds twice on one runner
+  (cached, then `--no-cache`, with `SOURCE_DATE_EPOCH`) and fails if the
+  digests differ. That checks determinism on one machine; it isn't an
+  independent rebuild.
+- *Coverage* threshold 40% is a ratchet at the current baseline (≈42%),
+  not a quality bar. Raise it as tests land; the target is 80%.
+- *DAST* is ZAP's passive, unauthenticated baseline. The deliberately
+  vulnerable agent paths (`/api/chat`, the `*_raw` tools) are out of its
+  reach, so G3 passing doesn't mean the lab vulnerabilities are gone.
+- *Accepted checkov skips* on the Rollout: `CKV_K8S_35` (the app reads
+  secrets from env only) and `CKV2_K8S_6` (no NetworkPolicy yet).
+- *Argo Rollouts ≥ v1.10.0* is required. Older versions error on the HTML
+  body of `/login`. v1.10 checks only the status code; the body condition
+  applies once upstream #4770 is released.
+- *Cluster-side prerequisites, not in git:* the Argo CD Application
+  `alienbank` (labels `dashboard.product=alienbank`,
+  `dashboard.environment=kind`), and the secrets `ghcr-pull` and
+  `alienbank-secrets`. `k8s/deploy.yaml` is the older manual path. Don't
+  apply it next to `deploy/kind`, because both define `alienbank`
+  Service/Ingress objects.
+
 ## Project layout
 
 ```
