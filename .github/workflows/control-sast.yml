@@ -1,0 +1,31 @@
+# SAST: no Critical/High (semgrep ERROR) findings.
+name: control-sast
+on:
+  workflow_call:
+    outputs:
+      result:
+        description: verdict JSON {status, detail, metrics} (.github/scripts/verdict.py)
+        value: ${{ jobs.control.outputs.result }}
+jobs:
+  control:
+    runs-on: ubuntu-latest
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+    permissions:
+      contents: read
+    container:
+      image: semgrep/semgrep:1.178.0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: semgrep scan --config p/default --config p/python --json --output semgrep.json --metrics=off || true
+      - id: verdict
+        if: always()
+        run: python3 .github/scripts/verdict.py semgrep semgrep.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: evidence-sast
+          path: semgrep.json
+          if-no-files-found: ignore

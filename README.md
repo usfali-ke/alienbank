@@ -351,21 +351,39 @@ only at L3 by **D4** — the exact payloads and the "why" per level are in
 
 ## DevSecOps control gates
 
-Delivery goes through five gates. Each one records its decision for the
-security dashboard. The dashboard can't be reached from GitHub-hosted
-runners, so it **pulls**: every gate uploads a `gate-result-<GATE>` artifact
-(`.github/actions/report-gate`), and the dashboard's GitHub collector polls
-for them. It trusts only runs of `.github/workflows/devsecops-*.yml` from this
-repo, never from forks. It also ignores PR results when the PR changes
-`.github/` itself.
+Delivery goes through five gates. Every gate has the same shape:
 
-| Gate | Workflow | Blocks on |
+- **one job per control, running in parallel.** Each control is a small
+  reusable workflow `.github/workflows/control-*.yml` (or an inline job for
+  GitHub API checks). It runs its tool, then `.github/scripts/verdict.py`
+  applies the threshold and **fails the job**, so a red job is a failed
+  control.
+- **one gate job at the end** (`.github/actions/gate`). It combines the
+  verdicts using the criterion list in `.github/scripts/gate.py`, uploads
+  `gate-result-<GATE>` for the dashboard, and fails unless every control
+  passed. A control that crashed, was skipped or was cancelled counts as a
+  fail.
+
+The dashboard can't be reached from GitHub-hosted runners, so it **pulls**
+those artifacts. It trusts only runs of `.github/workflows/devsecops-*.yml`
+from this repo, never from forks. It also ignores PR results when the PR
+changes `.github/` itself.
+
+```
+PR ──> devsecops-pr ──────── G1 merge gate        (required by the main ruleset)
+main ─> devsecops-build ──── G2 artifact gate ──> devsecops-uat ── G3 pre-production gate
+                                  signs the digest       tests that same digest
+manual > devsecops-release ─ G4 (release-approval env + dashboard) ──> G5 GitOps commit
+cluster: Kyverno (G6) · Argo Rollouts canary + rollback · Wazuh/Falco, Prometheus (G7)
+```
+
+| Gate | Workflow | Controls (jobs) — each blocks on |
 |---|---|---|
-| G1 merge | `devsecops-pr.yml` | reviewer approval on the head commit (author excluded), unit tests, semgrep ERROR findings, gitleaks leaks in the PR's commits, unverified commit signatures |
-| G2 artifact | `devsecops-main.yml` | non-reproducible build or unpinned base images; fixable Critical/High in uv.lock or the image (Trivy); checkov failures on Dockerfile + `deploy/kind` render; image runs as root; no CycloneDX SBOM. The image is signed only when all of these pass |
-| G3 pre-prod | `devsecops-main.yml` | the G2 digest, run read-only: unit + integration tests; k6 p95 > 500 ms; coverage below the ratchet; ZAP baseline High alerts; Trivy KSV/Pod Security Standards findings on the render |
-| G4 release | `devsecops-release.yml` → dashboard | the dashboard decides, from the change request, approvals, change window and this digest's G2/G3 results, and answers with the commit status `security-dashboard/G4` |
-| G5 deploy | `devsecops-release.yml` | cosign `slsaprovenance1` and `gh attestation verify` for this commit; kubeconform-strict render; then a GitOps commit to `deploy/kind` that Argo CD syncs |
+| G1 merge | `devsecops-pr.yml` | `reviewers`: approval on the head commit (author excluded) · `unit-tests` · `sast`: semgrep ERROR · `secrets`: gitleaks in the PR's commits · `commits-signed`: GitHub-verified signatures |
+| G2 artifact | `devsecops-build.yml` | `build`: unpinned base or non-reproducible build · `sca` / `image-scan`: fixable Critical/High (Trivy), root user · `iac`: checkov on Dockerfile + `deploy/kind` render · `sbom`: no CycloneDX SBOM · `sign`: signs only when all others passed, then verifies |
+| G3 pre-prod | `devsecops-uat.yml` | the G2 digest, run read-only: `functional` (unit + integration) · `performance` (k6 p95 > 500 ms) · `coverage` (below ratchet) · `dast` (ZAP High) · `compliance` (Trivy KSV / Pod Security Standards) |
+| G4 release | `devsecops-release.yml` → dashboard | a required reviewer approves the `release-approval` environment, **and** the dashboard approves the change record (approvals, window, this digest's G2/G3) via the commit status `security-dashboard/G4` |
+| G5 deploy | `devsecops-release.yml` | `provenance`: cosign `slsaprovenance1` + `gh attestation verify` for this commit · `config`: kubeconform-strict render, digest-only change · `deploy`: the GitOps commit to `deploy/kind` that Argo CD syncs |
 
 **Releasing:** open a *Change request* issue, which becomes `CHG-<number>`.
 Someone other than the requester applies the labels. Then run **Actions →

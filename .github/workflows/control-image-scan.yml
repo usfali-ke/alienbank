@@ -1,0 +1,52 @@
+# Container image: no fixable Critical/High, and a hardened base —
+# digest-pinned (checked by the build) and not running as root.
+name: control-image-scan
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: image@sha256:… under test (the G2 digest)
+        type: string
+        required: true
+      base-image:
+        type: string
+        required: true
+    outputs:
+      result:
+        description: verdict JSON {status, detail, metrics} (.github/scripts/verdict.py)
+        value: ${{ jobs.control.outputs.result }}
+jobs:
+  control:
+    runs-on: ubuntu-latest
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - env:
+          IMAGE_REF: ${{ inputs.image }}
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$HOME/.docker:/root/.docker:ro" aquasec/trivy:0.74.0 image --scanners vuln \
+            --severity CRITICAL,HIGH --format json --output /work/trivy-image.json --exit-code 0 "$IMAGE_REF" || true
+      - id: verdict
+        if: always()
+        env:
+          BASE_IMAGE: ${{ inputs.base-image }}
+        run: python3 .github/scripts/verdict.py trivy-image trivy-image.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: evidence-image-scan
+          path: trivy-image.json
+          if-no-files-found: ignore

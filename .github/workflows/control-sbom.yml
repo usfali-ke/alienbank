@@ -1,0 +1,46 @@
+# SBOM: a CycloneDX document that actually lists components. Uploaded as
+# artifact `sbom`; the sign job attests it onto the image.
+name: control-sbom
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: image@sha256:… under test (the G2 digest)
+        type: string
+        required: true
+    outputs:
+      result:
+        description: verdict JSON {status, detail, metrics} (.github/scripts/verdict.py)
+        value: ${{ jobs.control.outputs.result }}
+jobs:
+  control:
+    runs-on: ubuntu-latest
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
+      - uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        continue-on-error: true
+        with:
+          image: ${{ inputs.image }}
+          registry-username: ${{ github.actor }}
+          registry-password: ${{ github.token }}
+          syft-version: v1.52.0
+          format: cyclonedx-json
+          output-file: sbom.cdx.json
+          upload-artifact: false
+          upload-release-assets: false
+      - id: verdict
+        if: always()
+        run: python3 .github/scripts/verdict.py sbom sbom.cdx.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sbom
+          path: sbom.cdx.json
+          if-no-files-found: ignore

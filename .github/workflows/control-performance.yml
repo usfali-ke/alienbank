@@ -1,0 +1,56 @@
+# Performance: k6 p95 within the SLO, <1% failed requests, ≥99% checks.
+name: control-performance
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: image@sha256:… under test (the G2 digest)
+        type: string
+        required: true
+      slo-p95-ms:
+        type: string
+        default: "500"
+    outputs:
+      result:
+        description: verdict JSON {status, detail, metrics} (.github/scripts/verdict.py)
+        value: ${{ jobs.control.outputs.result }}
+jobs:
+  control:
+    runs-on: ubuntu-latest
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - id: app
+        uses: ./.github/actions/start-app
+        with:
+          image: ${{ inputs.image }}
+      - env:
+          TARGET_URL: ${{ steps.app.outputs.url }}
+        run: |
+          mkdir -p k6out
+          docker run --rm --network host --user "$(id -u):$(id -g)" \
+            -v "$PWD/tests/perf:/perf:ro" -v "$PWD/k6out:/out" \
+            -e TARGET_URL -e SUMMARY_OUT=/out/k6-summary.json \
+            grafana/k6:2.3.0 run /perf/login.js || true
+      - id: verdict
+        if: always()
+        env:
+          SLO_P95_MS: ${{ inputs.slo-p95-ms }}
+        run: python3 .github/scripts/verdict.py k6 k6out/k6-summary.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: evidence-performance
+          path: k6out/
+          if-no-files-found: ignore

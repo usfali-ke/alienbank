@@ -1,0 +1,86 @@
+# G3 — Pre-production: the exact digest G2 signed passes functional/
+# integration/regression, performance, coverage, DAST and compliance. The
+# five controls run in parallel; "G3 pre-production gate" records
+# `gate-result-G3` and fails unless all passed.
+#
+# Called by devsecops-build.yml after a G2 pass (same run), or run by hand
+# (Actions → devsecops-uat) to re-test a digest.
+#
+# Today each control starts the image on its own runner
+# (.github/actions/start-app); the target is a UAT namespace deployed by
+# GitOps once the self-hosted UAT runner exists.
+
+name: devsecops-uat
+
+on:
+  workflow_call:
+    inputs:
+      digest:
+        type: string
+        required: true
+  workflow_dispatch:
+    inputs:
+      digest:
+        description: sha256:… of ghcr.io/usfali-ke/alienbank to test
+        type: string
+        required: true
+
+permissions: {}
+
+jobs:
+  functional:
+    uses: ./.github/workflows/control-functional.yml
+    permissions:
+      contents: read
+      packages: read
+    with:
+      image: ghcr.io/usfali-ke/alienbank@${{ inputs.digest }}
+
+  performance:
+    uses: ./.github/workflows/control-performance.yml
+    permissions:
+      contents: read
+      packages: read
+    with:
+      image: ghcr.io/usfali-ke/alienbank@${{ inputs.digest }}
+      slo-p95-ms: "500"
+
+  dast:
+    uses: ./.github/workflows/control-dast.yml
+    permissions:
+      contents: read
+      packages: read
+    with:
+      image: ghcr.io/usfali-ke/alienbank@${{ inputs.digest }}
+
+  coverage:
+    uses: ./.github/workflows/control-coverage.yml
+    permissions:
+      contents: read
+    with:
+      threshold: "40"
+
+  compliance:
+    uses: ./.github/workflows/control-compliance.yml
+    permissions:
+      contents: read
+
+  gate:
+    name: G3 pre-production gate
+    needs: [functional, performance, dast, coverage, compliance]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
+      - uses: ./.github/actions/gate
+        with:
+          gate: G3
+          needs: ${{ toJSON(needs) }}
+          subject: ${{ inputs.digest }}
+          artifact-digest: ${{ inputs.digest }}
+          environment: ci

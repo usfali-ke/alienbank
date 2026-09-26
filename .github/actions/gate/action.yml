@@ -1,0 +1,61 @@
+name: Gate
+description: >
+  The last job of every gate. Combines the gate's control verdicts
+  (.github/scripts/gate.py lists which job answers which criterion),
+  uploads the decision as artifact `gate-result-<GATE>` — the security
+  dashboard pulls it, since GitHub-hosted runners can't reach the
+  dashboard — and fails unless every control passed.
+
+inputs:
+  gate:
+    description: G1 | G2 | G3 | G5
+    required: true
+  needs:
+    description: toJSON(needs) of the calling job
+    required: true
+  subject:
+    description: What was evaluated (pr-123, image digest). Re-evaluating the same subject after a fail counts as rework.
+    required: true
+  commit-sha:
+    default: ""
+  artifact-digest:
+    default: ""
+  environment:
+    default: ""
+  started-at:
+    description: ISO-8601; defaults to now
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - id: assemble
+      shell: bash
+      # Values via env only — a crafted branch name or tool message can't
+      # inject shell.
+      env:
+        NEEDS: ${{ inputs.needs }}
+        SUBJECT: ${{ inputs.subject }}
+        COMMIT_SHA: ${{ inputs.commit-sha }}
+        DIGEST: ${{ inputs.artifact-digest }}
+        ENVIRONMENT: ${{ inputs.environment }}
+        STARTED_AT: ${{ inputs.started-at }}
+        GATE: ${{ inputs.gate }}
+      run: |
+        mkdir -p "$RUNNER_TEMP/gate"
+        python3 .github/scripts/gate.py "$GATE" "$RUNNER_TEMP/gate/gate-result.json"
+    - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: gate-result-${{ inputs.gate }}
+        path: ${{ runner.temp }}/gate/gate-result.json
+        overwrite: true
+        retention-days: 30
+        if-no-files-found: error
+    - name: Enforce
+      if: steps.assemble.outputs.status != 'pass'
+      shell: bash
+      env:
+        GATE: ${{ inputs.gate }}
+      run: |
+        echo "::error::${GATE} failed — see the criteria in the job summary"
+        exit 1

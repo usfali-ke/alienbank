@@ -1,15 +1,21 @@
-# G4 — Release approval: the security dashboard decides, not this workflow.
-# This run publishes a `release-request` artifact; the dashboard's collector
-# evaluates it (change approved/readiness/client approval, window, G2/G3 of
-# this digest…) and answers with the commit status `security-dashboard/G4`
-# on this commit, pointing back at this run.
-# G5 — Deployment: only on a G4 success. Verifies provenance, validates the
-# target config, and deploys by committing the digest to deploy/kind; Argo
-# CD (app `alienbank`) syncs it and runs the canary analysis. Nothing here
-# talks to the cluster.
+# G4 — Release approval, then G5 — Deployment, for the digest G2 built
+# from this commit. Run from main: Actions → devsecops-release → Run
+# workflow, with the change-request issue number.
 #
-# Run from main: Actions → devsecops-release → Run workflow, with the
-# change-request issue number.
+#   G4 release approval ─┬─ provenance ─┐
+#   (environment          └─ config ────┴─ deploy ─ G5 deployment gate
+#    release-approval)
+#
+# G4 needs two independent approvals:
+#   1. the protected environment `release-approval` — GitHub holds the job
+#      until a required reviewer approves the run;
+#   2. the security dashboard's decision on the change record (approved,
+#      readiness, client approval, window, no open High/Critical, G2/G3 of
+#      this digest). This run leaves a `release-request` artifact; the
+#      dashboard answers with commit status `security-dashboard/G4`
+#      pointing at this run.
+# G5 deploys only by committing the digest to deploy/kind; Argo CD syncs
+# it and runs the canary analysis. Nothing here talks to the cluster.
 
 name: devsecops-release
 
@@ -36,13 +42,14 @@ concurrency:
 env:
   IMAGE: ghcr.io/usfali-ke/alienbank
   CHANGE_ID: CHG-${{ inputs.change }}
-  CERT_IDENTITY_REGEXP: ^https://github\.com/usfali-ke/alienbank/\.github/workflows/devsecops-main\.yml@refs/heads/main$
+  CERT_IDENTITY_REGEXP: ^https://github\.com/usfali-ke/alienbank/\.github/workflows/devsecops-build\.yml@refs/heads/main$
   CERT_ISSUER: https://token.actions.githubusercontent.com
 
 jobs:
   g4:
     name: G4 release approval
     if: github.ref == 'refs/heads/main'
+    environment: release-approval
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -51,6 +58,7 @@ jobs:
       statuses: read
     outputs:
       digest: ${{ steps.digest.outputs.digest }}
+      started-at: ${{ steps.digest.outputs.at }}
     steps:
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
@@ -62,31 +70,29 @@ jobs:
         run: |
           set -euo pipefail
           if ! digest=$(docker buildx imagetools inspect "${IMAGE}:sha-${GITHUB_SHA}" --format '{{.Manifest.Digest}}' 2>/dev/null) || [ -z "$digest" ]; then
-            echo "::error::No image ${IMAGE}:sha-${GITHUB_SHA} — devsecops-main (G2) hasn't built this commit, or failed before pushing"
+            echo "::error::No image ${IMAGE}:sha-${GITHUB_SHA} — devsecops-build (G2) hasn't built this commit, or failed before pushing"
             exit 1
           fi
-          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          { echo "digest=$digest"; echo "at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"; } >> "$GITHUB_OUTPUT"
           echo "Releasing ${IMAGE}@${digest} (${CHANGE_ID})"
       - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
         with:
           cosign-release: v2.6.5
       - name: Signed by G2
-        # G2 signs only digests that passed it, so an unsigned digest is one
-        # that failed G2 — don't even ask for approval.
+        # G2 signs only digests that passed it — an unsigned digest failed
+        # G2, so don't even ask for approval.
         env:
           DIGEST: ${{ steps.digest.outputs.digest }}
         run: |
           cosign verify --certificate-identity-regexp "$CERT_IDENTITY_REGEXP" \
             --certificate-oidc-issuer "$CERT_ISSUER" "${IMAGE}@${DIGEST}" >/dev/null \
             || { echo "::error::${IMAGE}@${DIGEST} has no valid G2 signature"; exit 1; }
-      - id: request
-        env:
+      - env:
           DIGEST: ${{ steps.digest.outputs.digest }}
         run: |
           mkdir -p "$RUNNER_TEMP/release-request"
           jq -n --arg change "$CHANGE_ID" --arg subject "$DIGEST" --arg sha "$GITHUB_SHA" \
-            '{change_id: $change, subject: $subject, commit_sha: $sha}' > "$RUNNER_TEMP/release-request/release-request.json"
-          cat "$RUNNER_TEMP/release-request/release-request.json"
+            '{change_id: $change, subject: $subject, commit_sha: $sha}' | tee "$RUNNER_TEMP/release-request/release-request.json"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-request
@@ -97,43 +103,40 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        # Only a status that points at this run answers this request; an
-        # older G4 status on the same commit belongs to another release.
+        # Only a status pointing at this run answers this request; an older
+        # G4 status on the same commit belongs to another release.
         run: |
           set -uo pipefail
           for _ in $(seq 60); do
             s=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/statuses?per_page=100" \
                   --jq "[.[] | select(.context == \"security-dashboard/G4\" and .target_url == \"${RUN_URL}\")][0] // empty" 2>/dev/null)
-            if [ -z "$s" ]; then sleep 20; continue; fi
-            state=$(jq -r '.state' <<<"$s")
-            desc=$(jq -r '.description // empty' <<<"$s")
-            case "$state" in
-              success) echo "G4: ${desc}"; exit 0 ;;
-              failure|error) echo "::error::${desc:-G4 blocked}"; exit 1 ;;
+            case "$(jq -r '.state // empty' <<<"${s:-null}")" in
+              success) echo "G4: $(jq -r .description <<<"$s")"; exit 0 ;;
+              failure|error) echo "::error::$(jq -r '.description // "G4 blocked"' <<<"$s")"; exit 1 ;;
             esac
             sleep 20
           done
           echo "::error::dashboard collector did not answer within 20 minutes (no security-dashboard/G4 status for this run)"
           exit 1
 
-  g5:
-    name: G5 deployment gate
+  provenance:
+    # Both stores, and the provenance must name this exact commit — a valid
+    # attestation for some other build of main isn't enough.
     needs: g4
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
       packages: read
       attestations: read
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
     env:
       DIGEST: ${{ needs.g4.outputs.digest }}
     steps:
-      - id: start
-        run: echo "at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # The deploy commit is pushed with this job's GITHUB_TOKEN.
-          persist-credentials: true
-          fetch-depth: 0
+          persist-credentials: false
+          sparse-checkout: .github
       - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
         with:
           cosign-release: v2.6.5
@@ -142,78 +145,90 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
-      - id: provenance
-        name: Verify provenance (cosign + GitHub attestation)
+      - id: check
         env:
           GH_TOKEN: ${{ github.token }}
-        # Both stores, and the provenance must name this exact commit — a
-        # valid attestation for some other build of main isn't enough.
         run: |
-          set -uo pipefail
           fail=""
           if cosign verify-attestation --type slsaprovenance1 --certificate-identity-regexp "$CERT_IDENTITY_REGEXP" \
-               --certificate-oidc-issuer "$CERT_ISSUER" "${IMAGE}@${DIGEST}" > "$RUNNER_TEMP/slsa.jsonl" 2>/dev/null; then
-            commits=$(jq -r '.payload | @base64d | fromjson | .predicate.buildDefinition.resolvedDependencies[]?.digest.gitCommit // empty' "$RUNNER_TEMP/slsa.jsonl" | sort -u)
-            grep -qx "$GITHUB_SHA" <<<"$commits" || fail="$fail slsa-commit-mismatch"
+               --certificate-oidc-issuer "$CERT_ISSUER" "${IMAGE}@${DIGEST}" > slsa.jsonl 2>/dev/null; then
+            jq -r '.payload | @base64d | fromjson | .predicate.buildDefinition.resolvedDependencies[]?.digest.gitCommit // empty' slsa.jsonl \
+              | grep -qx "$GITHUB_SHA" || fail="$fail slsa-commit-mismatch"
           else
             fail="$fail cosign-slsaprovenance1"
           fi
           gh attestation verify "oci://${IMAGE}@${DIGEST}" --repo "$GITHUB_REPOSITORY" \
-            --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/devsecops-main.yml" >/dev/null || fail="$fail gh-attestation"
+            --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/devsecops-build.yml" >/dev/null || fail="$fail gh-attestation"
           if [ -z "$fail" ]; then
-            echo "status=pass" >> "$GITHUB_OUTPUT"
-            echo "detail=cosign slsaprovenance1 (devsecops-main.yml@refs/heads/main, commit ${GITHUB_SHA:0:7}) and gh attestation verify both passed" >> "$GITHUB_OUTPUT"
+            { echo "status=pass"; echo "detail=cosign slsaprovenance1 (devsecops-build.yml@refs/heads/main, commit ${GITHUB_SHA:0:7}) and gh attestation verify both passed"; } >> "$GITHUB_OUTPUT"
           else
-            echo "status=fail" >> "$GITHUB_OUTPUT"
-            echo "detail=provenance verification failed:${fail}" >> "$GITHUB_OUTPUT"
+            { echo "status=fail"; echo "detail=provenance verification failed:${fail}"; } >> "$GITHUB_OUTPUT"
           fi
-      - id: config
-        name: Set digest and validate the deploy/kind render
+      - id: verdict
+        if: always()
+        env:
+          STATUS: ${{ steps.check.outputs.status }}
+          DETAIL: ${{ steps.check.outputs.detail || 'verification did not run' }}
+        run: python3 .github/scripts/verdict.py result "$STATUS" "$DETAIL"
+
+  config:
+    # The target config is controlled: the render is schema-valid and the
+    # only change vs git is the image digest.
+    needs: g4
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+    env:
+      DIGEST: ${{ needs.g4.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: check
         run: |
           set -uo pipefail
-          python3 - <<'PY' || { printf 'status=fail\ndetail=could not set the image digest in deploy/kind/kustomization.yaml\n' >> "$GITHUB_OUTPUT"; exit 0; }
-          import os, re
-          p = "deploy/kind/kustomization.yaml"
-          s, n = re.subn(r"(?m)^(    digest: )sha256:[0-9a-f]{64}$", r"\g<1>" + os.environ["DIGEST"], open(p).read())
-          if n != 1:
-              raise SystemExit(f"expected exactly one images[].digest line, found {n}")
-          open(p, "w").write(s)
-          PY
+          python3 .github/scripts/set_digest.py deploy/kind/kustomization.yaml "$DIGEST" || exit 0
           mkdir -p render
-          kubectl kustomize deploy/kind > render/kind.yaml || { printf 'status=fail\ndetail=kustomize build deploy/kind failed\n' >> "$GITHUB_OUTPUT"; exit 0; }
-          grep -q "image: ${IMAGE}@${DIGEST}" render/kind.yaml || { printf 'status=fail\ndetail=render does not reference the released digest\n' >> "$GITHUB_OUTPUT"; exit 0; }
-          # Rollout/AnalysisTemplate schemas come from the datreeio CRDs
-          # catalog; -strict rejects unknown fields instead of ignoring them.
+          kubectl kustomize deploy/kind > render/kind.yaml || exit 0
+          grep -q "image: ${IMAGE}@${DIGEST}" render/kind.yaml || { echo "::error::render does not reference the released digest"; exit 0; }
+          # Rollout/AnalysisTemplate schemas from the datreeio CRDs catalog;
+          # -strict rejects unknown fields instead of ignoring them.
           docker run --rm -v "$PWD/render:/render:ro" ghcr.io/yannh/kubeconform:v0.8.0 \
-            -strict -summary -output json \
-            -schema-location default \
+            -strict -summary -output json -schema-location default \
             -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
             /render/kind.yaml > render/kubeconform.json
-          rc=$?
-          changed=$(git status --porcelain | awk '{print $2}' | grep -v '^render/' | tr '\n' ' ')
-          python3 - "$rc" "$changed" <<'PY'
-          import json, os, sys
-          rc, changed = sys.argv[1], sys.argv[2].split()
-          try:
-              summary = json.load(open("render/kubeconform.json")).get("summary", {})
-          except (OSError, ValueError):
-              summary = {}
-          valid, total = summary.get("valid", 0), sum(summary.get(k, 0) for k in ("valid", "invalid", "errors", "skipped"))
-          ok = rc == "0" and total > 0 and valid == total and changed == ["deploy/kind/kustomization.yaml"]
-          detail = (f"deploy/kind render: {valid}/{total} resources valid (kubeconform -strict, CRDs-catalog schemas); "
-                    f"change vs git: {', '.join(changed) or 'none'} (image digest only)")
-          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
-              out.write(f"status={'pass' if ok else 'fail'}\ndetail={detail}\n")
-          print(detail)
-          PY
-      - id: deploy
-        name: GitOps commit
-        if: steps.provenance.outputs.status == 'pass' && steps.config.outputs.status == 'pass'
-        # The only write path to the cluster: a commit on main that Argo CD
-        # syncs. [skip ci] keeps it from re-running G2 (deploy/** is also
-        # path-ignored there).
+          echo "rc=$?" >> "$GITHUB_OUTPUT"
+          echo "changed=$(git status --porcelain | awk '{print $2}' | grep -v '^render/' | tr '\n' ' ')" >> "$GITHUB_OUTPUT"
+      - id: verdict
+        if: always()
+        env:
+          RC: ${{ steps.check.outputs.rc }}
+          CHANGED: ${{ steps.check.outputs.changed }}
+        run: python3 .github/scripts/verdict.py kubeconform render/kubeconform.json
+
+  deploy:
+    # The only write path to the cluster: a commit on main that Argo CD
+    # syncs. [skip ci] keeps it from re-running G2 (deploy/** is also
+    # path-ignored there).
+    needs: [g4, provenance, config]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+    env:
+      DIGEST: ${{ needs.g4.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: true
+          fetch-depth: 0
+      - id: commit
         run: |
           set -euo pipefail
+          python3 .github/scripts/set_digest.py deploy/kind/kustomization.yaml "$DIGEST"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add deploy/kind/kustomization.yaml
@@ -221,58 +236,20 @@ jobs:
             -m "Released ${IMAGE}@${DIGEST} from ${GITHUB_SHA} by ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           git push origin HEAD:main
           echo "gitops_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-      - id: assemble
+      - id: verdict
         if: always()
         env:
-          PROV_STATUS: ${{ steps.provenance.outputs.status }}
-          PROV_DETAIL: ${{ steps.provenance.outputs.detail }}
-          CONFIG_STATUS: ${{ steps.config.outputs.status }}
-          CONFIG_DETAIL: ${{ steps.config.outputs.detail }}
-          GITOPS_SHA: ${{ steps.deploy.outputs.gitops_sha }}
-          DEPLOY_OUTCOME: ${{ steps.deploy.outcome }}
+          SHA: ${{ steps.commit.outputs.gitops_sha }}
         run: |
-          python3 - <<'PY'
-          import json, os
-          e = os.environ.get
-
-          def crit(key, category, status, detail):
-              if status not in ("pass", "fail"):
-                  status, detail = "fail", "check did not complete"
-              return {"key": key, "category": category, "status": status, "detail": detail}
-
-          sha = e("GITOPS_SHA")
-          if sha:
-              path = ("pass", f"GitOps commit {sha[:7]} → Argo CD app alienbank")
-          elif e("DEPLOY_OUTCOME") == "skipped":
-              path = ("fail", "not deployed: provenance or target config check failed")
-          else:
-              path = ("fail", "GitOps commit/push to main failed")
-          criteria = [
-              crit("artifact_provenance_verified", "security", e("PROV_STATUS"), e("PROV_DETAIL")),
-              crit("target_env_config_controlled", "delivery", e("CONFIG_STATUS"), e("CONFIG_DETAIL")),
-              crit("approved_gitops_pipeline_path", "governance", *path),
-          ]
-          status = "pass" if all(c["status"] == "pass" for c in criteria) else "fail"
-          for c in criteria:
-              print(f"{c['status']:>4}  {c['key']}: {c['detail']}")
-          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-              f.write(f"status={status}\ncriteria={json.dumps(criteria)}\n")
-          PY
-      - uses: ./.github/actions/report-gate
-        if: always() && steps.assemble.outputs.status != ''
-        with:
-          gate: G5
-          status: ${{ steps.assemble.outputs.status }}
-          subject: ${{ env.DIGEST }}
-          criteria-json: ${{ steps.assemble.outputs.criteria }}
-          artifact-digest: ${{ env.DIGEST }}
-          environment: kind
-          started-at: ${{ steps.start.outputs.at }}
-      - id: event
-        name: Build deployment-event
-        if: steps.deploy.outputs.gitops_sha != ''
+          if [ -n "$SHA" ]; then
+            python3 .github/scripts/verdict.py result pass "GitOps commit ${SHA:0:7} → Argo CD app alienbank-kind"
+          else
+            python3 .github/scripts/verdict.py result fail "GitOps commit/push to main failed"
+          fi
+      - name: Build deployment-event
+        if: steps.commit.outputs.gitops_sha != ''
         env:
-          GITOPS_SHA: ${{ steps.deploy.outputs.gitops_sha }}
+          GITOPS_SHA: ${{ steps.commit.outputs.gitops_sha }}
           KIND: ${{ inputs.kind }}
         # in_progress: the commit is only the start. Argo CD notifications
         # report the sync/canary outcome under the same external_id
@@ -287,17 +264,32 @@ jobs:
             '{external_id: $id, environment: "kind", change_id: $change, commit_sha: $sha,
               artifact_digest: $digest, commit_at: $commit_at, started_at: $started,
               status: "in_progress", kind: $kind, via_approved_path: true, break_glass: false,
-              run_url: $run}' > "$RUNNER_TEMP/deployment-event/deployment.json"
-          cat "$RUNNER_TEMP/deployment-event/deployment.json"
+              run_url: $run}' | tee "$RUNNER_TEMP/deployment-event/deployment.json"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: steps.deploy.outputs.gitops_sha != ''
+        if: steps.commit.outputs.gitops_sha != ''
         with:
           name: deployment-event
           path: ${{ runner.temp }}/deployment-event/deployment.json
           if-no-files-found: error
           retention-days: 30
-      - name: Enforce
-        if: always() && steps.assemble.outputs.status != 'pass'
-        run: |
-          echo "::error::G5 deployment gate failed"
-          exit 1
+
+  gate-g5:
+    name: G5 deployment gate
+    needs: [g4, provenance, config, deploy]
+    if: always() && needs.g4.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
+      - uses: ./.github/actions/gate
+        with:
+          gate: G5
+          needs: ${{ toJSON(needs) }}
+          subject: ${{ needs.g4.outputs.digest }}
+          artifact-digest: ${{ needs.g4.outputs.digest }}
+          environment: kind
+          started-at: ${{ needs.g4.outputs.started-at }}

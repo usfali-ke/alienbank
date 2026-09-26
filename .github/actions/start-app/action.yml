@@ -1,0 +1,39 @@
+name: Start the app
+description: >
+  Runs the exact image digest under test on this runner, read-only root,
+  with no LLM/embedder reachable (the app logs and continues without its
+  RAG index), and waits for /login. Stand-in for the UAT environment until
+  G3 runs against the GitOps-deployed UAT namespace.
+
+inputs:
+  image:
+    description: image@sha256:… (the G2 digest)
+    required: true
+
+outputs:
+  url:
+    value: http://127.0.0.1:8080
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        IMAGE_REF: ${{ inputs.image }}
+      run: |
+        set -uo pipefail
+        ALIENBANK_SECRET_KEY=$(openssl rand -hex 32); export ALIENBANK_SECRET_KEY
+        echo "::add-mask::$ALIENBANK_SECRET_KEY"
+        docker run -d --name alienbank -p 127.0.0.1:8080:8080 --read-only \
+          --tmpfs /tmp --tmpfs /app/data:uid=10001,gid=10001,mode=0700 --tmpfs /app/.cache:uid=10001,gid=10001 \
+          -e ALIENBANK_SECRET_KEY -e ALIENBANK_LLM_PROVIDER=ollama \
+          -e OLLAMA_BASE_URL=http://127.0.0.1:9/v1 -e ALIENBANK_EMBED_BASE_URL=http://127.0.0.1:9/v1 \
+          -e ALIENBANK_GUARD_BASE_URL=http://127.0.0.1:9/v1 \
+          "$IMAGE_REF" || exit 1
+        for _ in $(seq 60); do
+          curl -fsS -o /dev/null http://127.0.0.1:8080/login && exit 0
+          sleep 3
+        done
+        docker logs alienbank | tail -50
+        echo "::error::app did not become ready"
+        exit 1
