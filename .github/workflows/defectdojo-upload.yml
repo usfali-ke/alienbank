@@ -22,7 +22,7 @@ on:
     types: [completed]
 
 permissions:
-  actions: read   # download the triggering run's artifacts
+  actions: read   # list and download the triggering run's artifacts
   contents: read  # check out the upload script
 
 concurrency:
@@ -44,19 +44,15 @@ jobs:
           sparse-checkout: .github/scripts
           sparse-checkout-cone-mode: false
 
-      - name: Download the run's reports
-        uses: actions/download-artifact@v4
-        continue-on-error: true  # a run that published no artifacts
-        with:
-          run-id: ${{ github.event.workflow_run.id }}
-          github-token: ${{ github.token }}
-          path: artifacts
-
       - name: Push to DefectDojo
+        # The script downloads the run's scan-report artifacts itself (not
+        # the container image or gate results) and fails the job if it
+        # can't, so a run whose reports never arrived can't look green.
         env:
           DD_URL: ${{ vars.DEFECTDOJO_URL || 'http://172.19.0.1:8080/api/v2' }}
           DD_API_KEY: ${{ secrets.DEFECTDOJO_API_KEY }}
           DD_PRODUCT: alienbank
+          GITHUB_TOKEN: ${{ github.token }}
           ARTIFACT_DIR: artifacts
           RUN_ID: ${{ github.event.workflow_run.id }}
           RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
