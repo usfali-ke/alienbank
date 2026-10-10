@@ -25,7 +25,9 @@ Standard library only — no pip install on the runner.
 
 Environment:
   DD_URL, DD_API_KEY, DD_PRODUCT          DefectDojo API root (…/api/v2), token, product name
-  ARTIFACT_DIR                            downloaded artifacts, one sub-directory each
+  ARTIFACT_DIR                            artifacts, one sub-directory each (default ./artifacts)
+  GITHUB_TOKEN, GITHUB_REPOSITORY         when set, the run's artifacts are downloaded into
+                                          ARTIFACT_DIR first (scan reports only, see SKIP_ARTIFACTS)
   RUN_ID, RUN_ATTEMPT, RUN_URL, EVENT, HEAD_BRANCH, HEAD_SHA, DEFAULT_BRANCH, PR_NUMBER
   DRY_RUN=1                               print the plan, upload nothing
 """
@@ -39,7 +41,10 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+import io
+import time
 import uuid
+import zipfile
 from pathlib import Path
 
 # File name -> DefectDojo scan type, for artifacts without a manifest.
@@ -61,6 +66,10 @@ UNSUPPORTED = {
     re.compile(r"^zap[-\w]*\.json$"): "DefectDojo's ZAP parser only accepts XML — also write the report with `-x zap.xml`",
 }
 PREFIXES = ("evidence-", "report-", "scan-")
+# Artifacts that never hold scan reports — the container image tarball
+# alone is ~50 MB — and a size cap for anything else.
+SKIP_ARTIFACTS = re.compile(r"^(image|gate-result.*|gate-preview.*|deployment-event.*|release-request)$")
+MAX_ARTIFACT_BYTES = 50 * 1024 * 1024
 
 
 def log(msg: str) -> None:
@@ -73,6 +82,58 @@ def warn(msg: str) -> None:
 
 def env(name: str, default: str = "") -> str:
     return os.environ.get(name, default).strip()
+
+
+def _github(url: str, token: str, *, raw: bool = False):
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"})
+    for attempt in range(4):
+        try:
+            if not raw:
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    return json.loads(resp.read())
+            # The zip download redirects to blob storage, which must NOT get
+            # the GitHub token (urllib would forward it): follow it by hand.
+            class NoRedirect(urllib.request.HTTPRedirectHandler):
+                def redirect_request(self, *args, **kwargs):
+                    return None
+            try:
+                urllib.request.build_opener(NoRedirect).open(req, timeout=60)
+                raise RuntimeError("expected a redirect to the artifact archive")
+            except urllib.error.HTTPError as exc:
+                if exc.code not in (301, 302, 303, 307, 308):
+                    raise
+                location = exc.headers["Location"]
+            with urllib.request.urlopen(location, timeout=300) as resp:
+                return resp.read()
+        except (urllib.error.URLError, TimeoutError) as exc:
+            if attempt == 3 or (isinstance(exc, urllib.error.HTTPError) and exc.code < 500 and exc.code != 429):
+                raise
+            time.sleep(2 ** attempt)
+
+
+def download_artifacts(dest: Path) -> int:
+    """Fetch the run's scan-report artifacts into dest/<artifact name>/."""
+    token, repo, run = env("GITHUB_TOKEN"), env("GITHUB_REPOSITORY"), env("RUN_ID")
+    api = env("GITHUB_API_URL", "https://api.github.com")
+    listed, page = [], 1
+    while True:
+        batch = _github(f"{api}/repos/{repo}/actions/runs/{run}/artifacts?per_page=100&page={page}", token)["artifacts"]
+        listed += batch
+        if len(batch) < 100:
+            break
+        page += 1
+    wanted = [a for a in listed if not a["expired"] and not SKIP_ARTIFACTS.match(a["name"]) and a["size_in_bytes"] <= MAX_ARTIFACT_BYTES]
+    log(f"run {run}: {len(listed)} artifact(s), downloading {len(wanted)} that can hold scan reports")
+    root = dest.resolve()
+    for a in wanted:
+        with zipfile.ZipFile(io.BytesIO(_github(a["archive_download_url"], token, raw=True))) as zf:
+            target = (dest / a["name"]).resolve()
+            for member in zf.namelist():
+                out = (target / member).resolve()
+                if root not in out.parents:  # zip-slip: never write outside dest
+                    raise RuntimeError(f"artifact {a['name']} has an unsafe path: {member}")
+            zf.extractall(target)
+    return len(wanted)
 
 
 def build_order(build_id: str | None) -> tuple[int, int] | None:
@@ -197,7 +258,15 @@ def main() -> int:
     if not product:
         log("DD_PRODUCT (repo variable DEFECTDOJO_PRODUCT) is not set — nothing to do")
         return 0
-    uploads = plan(Path(env("ARTIFACT_DIR", "artifacts")))
+    artifact_dir = Path(env("ARTIFACT_DIR", "artifacts"))
+    if env("GITHUB_TOKEN") and env("GITHUB_REPOSITORY") and env("RUN_ID"):
+        try:
+            download_artifacts(artifact_dir)
+        except (urllib.error.URLError, RuntimeError, zipfile.BadZipFile, KeyError) as exc:
+            # Fail loudly: a run whose reports can't be fetched must not look uploaded.
+            print(f"::error::Could not download the run's artifacts: {exc}", flush=True)
+            return 1
+    uploads = plan(artifact_dir)
     engagement = engagement_name()
     build_id = f"gh-{env('RUN_ID')}-{env('RUN_ATTEMPT', '1')}"
     log(f"{len(uploads)} report(s) -> DefectDojo product {product!r}, engagement {engagement!r}, build {build_id}")
