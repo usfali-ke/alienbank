@@ -142,10 +142,24 @@ def build_order(build_id: str | None) -> tuple[int, int] | None:
     return (int(m.group(1)), int(m.group(2))) if m else None
 
 
+def pr_for_commit() -> str:
+    """The PR a commit belongs to, when the run doesn't say. GitHub only
+    attaches PR numbers to a workflow_run while the PR is open, so a PR merged
+    before its pipeline finished arrives without one."""
+    token, repo, sha = env("GITHUB_TOKEN"), env("GITHUB_REPOSITORY"), env("HEAD_SHA")
+    if not (token and repo and sha):
+        return ""
+    try:
+        pulls = _github(f"{env('GITHUB_API_URL', 'https://api.github.com')}/repos/{repo}/commits/{sha}/pulls", token)
+        return str(pulls[0]["number"]) if pulls else ""
+    except (urllib.error.URLError, KeyError, IndexError, ValueError):
+        return ""
+
+
 def engagement_name() -> str:
     event, branch, default = env("EVENT"), env("HEAD_BRANCH"), env("DEFAULT_BRANCH", "main")
     if event.startswith("pull_request"):
-        pr = env("PR_NUMBER")
+        pr = env("PR_NUMBER") or pr_for_commit()
         return f"PR #{pr}" if pr else f"Branch {branch}"
     return "CI/CD" if branch == default else f"Branch {branch}"
 
