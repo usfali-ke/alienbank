@@ -1,5 +1,6 @@
 # G1 — Merge: required reviewers approved AND unit tests pass AND SAST and
-# secret scan clean of Critical/High AND commits signed.
+# secret scan clean of Critical/High AND commits signed AND the AI security
+# review (Hermes) reports no Critical/High.
 #
 # Shape (same for every gate): one job per control, all in parallel; each
 # ends with .github/scripts/verdict.py, which decides pass/fail and fails
@@ -95,9 +96,18 @@ jobs:
       base: ${{ github.event.pull_request.base.sha }}
       head: ${{ github.event.pull_request.head.sha }}
 
+  ai-review:
+    uses: ./.github/workflows/control-ai-review.yml
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+    secrets:
+      HERMES_WEBHOOK_SECRET: ${{ secrets.HERMES_WEBHOOK_SECRET }}
+
   gate:
     name: G1 merge gate
-    needs: [reviewers, commits-signed, unit-tests, sast, secrets]
+    needs: [reviewers, commits-signed, unit-tests, sast, secrets, ai-review]
     if: always()
     runs-on: ubuntu-latest
     permissions:

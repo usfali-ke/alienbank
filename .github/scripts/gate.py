@@ -25,6 +25,7 @@ GATES = {
         ("sast", "sast_clean", "security"),
         ("secrets", "secrets_clean", "security"),
         ("commits-signed", "commits_signed", "security"),
+        ("ai-review", "ai_security_review_clean", "security"),
     ],
     "G2": [
         ("build", "reproducible_build_config_controlled", "delivery"),

@@ -1,0 +1,52 @@
+# AI security review (Hermes) as a G1 control — the `ai-review` job of the
+# PR pipeline, next to sast/secrets. Fails on any Critical/High finding in
+# Hermes's review of this head commit; Medium/Low are advisory.
+#
+# Runs on the self-hosted `lab-runner`: the Hermes gateway is on the lab
+# network (http://192.168.122.191:8644), which GitHub-hosted runners can't
+# reach. Nothing here checks out or runs PR code beyond .github/scripts —
+# Hermes reads the diff itself through `gh`.
+#
+# Setup: secret HERMES_WEBHOOK_SECRET (= the gateway route's secret);
+# optional variables HERMES_WEBHOOK_URL, HERMES_COMMENTER (the GitHub login
+# Hermes posts as — set it once Hermes has its own account, so no one else's
+# comment can satisfy the control).
+# Source of truth: security-dashboard/pipeline/github/hermes-pr-review/.
+name: control-ai-review
+on:
+  workflow_call:
+    outputs:
+      result:
+        description: verdict JSON {status, detail, metrics} (.github/scripts/hermes_review.py)
+        value: ${{ jobs.control.outputs.result }}
+    secrets:
+      HERMES_WEBHOOK_SECRET:
+        required: false
+jobs:
+  control:
+    name: AI security review · Hermes
+    # Fork PRs never run on the self-hosted runner (they get no secret either).
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: lab-runner
+    timeout-minutes: 30
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+      - id: verdict
+        env:
+          HERMES_URL: ${{ vars.HERMES_WEBHOOK_URL || 'http://192.168.122.191:8644/webhooks/github-pr-review' }}
+          HERMES_SECRET: ${{ secrets.HERMES_WEBHOOK_SECRET }}
+          HERMES_COMMENTER: ${{ vars.HERMES_COMMENTER }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          WAIT_SECONDS: "1500"
+        run: python3 .github/scripts/hermes_review.py
