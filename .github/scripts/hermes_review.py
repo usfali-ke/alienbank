@@ -1,4 +1,4 @@
-"""Hermes AI security review as a G1 pipeline control (`ai-review` job).
+"""Hermes Agent SAST review as a G1 pipeline control (`ai-review` job).
 
     python3 .github/scripts/hermes_review.py
 
@@ -77,7 +77,7 @@ def finish(status: str, detail: str, **metrics) -> NoReturn:
             json.dump({"control": "ai-review", **out}, f, indent=2)
     if env("GITHUB_STEP_SUMMARY"):
         with open(env("GITHUB_STEP_SUMMARY"), "a") as f:
-            f.write(f"### AI security review (Hermes): {status}\n\n{detail}\n")
+            f.write(f"### SAST · Hermes Agent: {status}\n\n{detail}\n")
     print(f"{status}: {detail}")
     if status != "pass":
         print(f"::error::{detail[:500]}")

@@ -26,6 +26,11 @@ on:
         description: Change request issue number (the CHG-<n> being released)
         required: true
         type: number
+      allow-self-approval:
+        description: 'SEGREGATION-OF-DUTIES EXCEPTION (single-operator mode): approve with the starter/author account. Opt-in per run; honoured only for a repository admin, and recorded in the verdict detail.'
+        required: false
+        type: boolean
+        default: false
       kind:
         description: Deployment kind
         required: true
@@ -56,6 +61,12 @@ jobs:
       contents: read
       packages: read
       statuses: read
+      # approvals.sh reads this run's actor/re-runner and its environment
+      # approvals, plus the change's pull requests and their commits, to
+      # decide who may approve — and the repo admins for the admin-gated
+      # self-approval waiver.
+      actions: read
+      pull-requests: read
     outputs:
       digest: ${{ steps.digest.outputs.digest }}
       started-at: ${{ steps.digest.outputs.at }}
@@ -87,6 +98,61 @@ jobs:
           cosign verify --certificate-identity-regexp "$CERT_IDENTITY_REGEXP" \
             --certificate-oidc-issuer "$CERT_ISSUER" "${IMAGE}@${DIGEST}" >/dev/null \
             || { echo "::error::${IMAGE}@${DIGEST} has no valid G2 signature"; exit 1; }
+      - id: change
+        name: Change request
+        # The release takes `change:` as a required input (CHG-<n>) — there
+        # is no picker. change.sh resolves that id and fails with its own
+        # actionable diagnostics when the issue doesn't exist or is a pull
+        # request.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHANGE: ${{ inputs.change }}
+          SOURCE_SHA: ${{ github.sha }}
+          REQUIRE: "true"
+        run: bash .github/scripts/change.sh
+      - name: Change request is open and names this release
+        # CAB: before the approval is asked for, the change request must
+        # still be OPEN and must name this release — this commit (full sha
+        # or a ≥7-char prefix) or this run's URL. That is what ties the
+        # release to the change it is authorised by.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ID: ${{ steps.change.outputs.id }}
+          NUMBER: ${{ steps.change.outputs.number }}
+          STATE: ${{ steps.change.outputs.state }}
+          URL: ${{ steps.change.outputs.url }}
+          SOURCE_SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          problem=""
+          [ "$STATE" = open ] || problem="is ${STATE:-unknown}, not open"
+          text=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${NUMBER}" \
+                   --jq '[.title, (.body // "")] | join("\n")' 2>/dev/null) \
+            || { echo "::error::${ID}: cannot read the change request from GitHub — CAB validation could not run"; exit 1; }
+          comments=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${NUMBER}/comments?per_page=100" \
+                       --jq '.[].body // ""' 2>/dev/null) || comments=""
+          if ! grep -qiF "$RUN_URL" <<<"${text}${comments}" \
+             && ! grep -qiE "(^|[^0-9a-f])${SOURCE_SHA:0:7}" <<<"${text}${comments}"; then
+            problem="${problem:+${problem}; }does not name this release (${SOURCE_SHA:0:7} or ${RUN_URL})"
+          fi
+          if [ -n "$problem" ]; then
+            echo "::error::${ID} ${problem} — a release needs an OPEN change request naming it. Add the release reference (${SOURCE_SHA:0:7} or ${RUN_URL}) to ${URL}, or start the release for the change it belongs to."
+            exit 1
+          fi
+          echo "${ID}: open, and names this release (${SOURCE_SHA:0:7})" | tee -a "$GITHUB_STEP_SUMMARY"
+      - id: sod
+        name: Separation of duties
+        # Whoever started (or re-ran) this run, and whoever authored the
+        # change being released (its pull request and commits — never the
+        # merge commit), can't be its approver; the single-operator waiver
+        # is admin-gated inside approvals.sh. The dashboard checks the same
+        # thing independently, from GitHub rather than this artifact.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ github.sha }}
+          ALLOW_SELF_APPROVAL: ${{ inputs.allow-self-approval || vars.ALLOW_SELF_APPROVAL }}
+        run: bash .github/scripts/approvals.sh release-approval
       - env:
           DIGEST: ${{ steps.digest.outputs.digest }}
         run: |
@@ -218,6 +284,7 @@ jobs:
       contents: write
     outputs:
       result: ${{ steps.verdict.outputs.result }}
+      gitops-sha: ${{ steps.commit.outputs.gitops_sha }}
     env:
       DIGEST: ${{ needs.g4.outputs.digest }}
     steps:
@@ -232,6 +299,18 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add deploy/kind/kustomization.yaml
+          if git diff --cached --quiet; then
+            # Idempotent re-deploy: this digest is already pinned (a re-run
+            # of the same release, or a promotion of what it already runs).
+            # There is nothing to commit, and an empty `git commit` would
+            # fail the job — so carry forward the commit that put this digest
+            # there, which is what the deployment event and post-deploy then
+            # refer to.
+            gitops_sha=$(git log -1 --format=%H -- deploy/kind/kustomization.yaml)
+            echo "deploy/kind already pins ${DIGEST:0:19}… (${gitops_sha:0:7}) — nothing to commit"
+            echo "gitops_sha=$gitops_sha" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           git commit -m "deploy(kind): alienbank ${DIGEST:7:12} ${CHANGE_ID} [skip ci]" \
             -m "Released ${IMAGE}@${DIGEST} from ${GITHUB_SHA} by ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           git push origin HEAD:main
@@ -293,3 +372,63 @@ jobs:
           artifact-digest: ${{ needs.g4.outputs.digest }}
           environment: kind
           started-at: ${{ needs.g4.outputs.started-at }}
+
+  post-deploy:
+    name: Deploy · verify the rollout (G6 status)
+    # Argo CD reports G6 (sync, canary analysis, Kyverno admission) to the
+    # dashboard; the dashboard mirrors it as commit status
+    # `security-dashboard/G6` on the deploy commit. This repo deploys to the
+    # one `kind` environment, so the BARE context is the right one (the
+    # per-environment `security-dashboard/G6/<env>` form is for the
+    # multi-target ladder that does not apply here — see the security
+    # dashboard's backend/app/g6_statuses.py). A GitHub-hosted runner can't
+    # see the cluster, so this is how the release learns the outcome.
+    needs: [deploy]
+    if: ${{ !cancelled() && needs.deploy.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      contents: read
+      statuses: read
+    outputs:
+      result: ${{ steps.verdict.outputs.result }}
+    env:
+      GITOPS_SHA: ${{ needs.deploy.outputs.gitops-sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
+      - id: wait
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          mkdir -p reports/post-deploy
+          context="security-dashboard/G6"
+          for _ in $(seq 90); do
+            s=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITOPS_SHA}/statuses?per_page=100" \
+                  --jq "[.[] | select(.context == \"${context}\")][0] // empty" 2>/dev/null)
+            state=$(jq -r '.state // empty' <<<"${s:-null}")
+            desc=$(jq -r '.description // ""' <<<"${s:-null}")
+            if [ "$state" = success ] || [ "$state" = failure ] || [ "$state" = error ]; then
+              jq . <<<"$s" > "reports/post-deploy/g6-status.json"
+              { echo "status=$([ "$state" = success ] && echo pass || echo fail)"
+                echo "detail=G6 ${state}: ${desc} ($(jq -r '.target_url // ""' <<<"$s"))"; } >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            sleep 20
+          done
+          { echo "status=fail"; echo "detail=no ${context} status on ${GITOPS_SHA:0:7} within 30 minutes (Argo CD sync or notification didn't reach the dashboard)"; } >> "$GITHUB_OUTPUT"
+      - id: verdict
+        if: always()
+        env:
+          STATUS: ${{ steps.wait.outputs.status }}
+          DETAIL: ${{ steps.wait.outputs.detail || 'wait did not run' }}
+        run: python3 .github/scripts/verdict.py result "$STATUS" "$DETAIL"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: report-kind-post-deploy
+          path: reports/post-deploy/
+          if-no-files-found: ignore
