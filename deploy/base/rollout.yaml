@@ -1,6 +1,23 @@
 # Progressive delivery: half the replicas move to the new digest, the
 # AnalysisTemplate probes the canary, and only a passing analysis promotes
 # to 100%. A failed analysis aborts and scales the canary back to stable.
+#
+# Data: SQLite (`/app/data/alienbank.db`), the ChromaDB index
+# (`/app/data/chroma`) and the L2+ audit trail (`/app/data/audit.jsonl`) all
+# live under $DATA_DIR = /app/data — a per-pod emptyDir. Each pod seeds its
+# own database and nothing survives a restart: enough for gate and canary
+# testing, not a data design. ALIENBANK_SECRET_KEY (required — config.py
+# refuses to start without a real key) and the provider tokens come from the
+# Secret `alienbank-secrets`, created out of band; never in git.
+#
+# Hardening: these namespaces enforce Pod Security `restricted` AND the
+# cluster's Kyverno G6 policies (disallow-privileged,
+# require-container-hardening, require-probes, require-resource-limits,
+# require-image-digest, restrict-image-registries), so every field below is
+# load-bearing, not style.
+#
+# Shared by every environment; deploy/<env>/ sets the namespace, the replica
+# count, the namespace-qualified host names and the image digest.
 apiVersion: argoproj.io/v1alpha1
 kind: Rollout
 metadata:
@@ -38,23 +55,36 @@ spec:
         # docker-registry secret for ghcr.io, created cluster-side (the
         # package is private). Not in git.
         - name: ghcr-pull
+      # require-container-hardening: the token is never mounted.
       automountServiceAccountToken: false
       securityContext:
+        # Pod-level runAsNonRoot is what disallow-privileged accepts, and the
+        # numeric user/group is what the image's `USER 10001:10001` is —
+        # numeric so runAsNonRoot verifies it without reading /etc/passwd.
+        # fsGroup is what makes the emptyDir mounts writable by uid 10001.
         runAsNonRoot: true
         runAsUser: 10001
         runAsGroup: 10001
         fsGroup: 10001
+        # require-container-hardening: pod-level profile covers every container.
         seccompProfile:
           type: RuntimeDefault
       containers:
         - name: alienbank
           # Kustomize `images:` rewrites this to ghcr.io/...@sha256:<digest>.
+          # A bare name is fine here: the overlays always pin a digest, so the
+          # cluster never pulls a tag.
           image: alienbank
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
               containerPort: 8080
+              # The API server defaults this to TCP. Left out of git, the live
+              # Rollout always differs from the render, so the Argo CD app
+              # stays OutOfSync and re-syncs on every commit to main.
+              protocol: TCP
           envFrom:
+            # Non-secret runtime config (provider endpoints, level toggles).
             - configMapRef:
                 name: alienbank-config
             # ALIENBANK_SECRET_KEY and provider credentials, created
@@ -62,12 +92,17 @@ spec:
             - secretRef:
                 name: alienbank-secrets
           securityContext:
+            # disallow-privileged + require-container-hardening, field for field.
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
+            privileged: false
+            runAsNonRoot: true
             capabilities:
               drop: ["ALL"]
           # The app writes only to /app/data (SQLite, chroma, audit log);
-          # /tmp and $HOME/.cache cover Python/library scratch files.
+          # /tmp and $HOME/.cache (/app/.cache) cover Python/library scratch
+          # files, which is all a readOnlyRootFilesystem leaves broken without
+          # them.
           volumeMounts:
             - name: data
               mountPath: /app/data
@@ -75,6 +110,8 @@ spec:
               mountPath: /tmp
             - name: cache
               mountPath: /app/.cache
+          # require-probes. /login is the app's only cheap, always-on 200: it
+          # serves the login form without touching the LLM or the RAG index.
           readinessProbe:
             httpGet:
               path: /login
@@ -87,6 +124,7 @@ spec:
               port: http
             initialDelaySeconds: 10
             periodSeconds: 20
+          # require-resource-limits: requests cpu+memory and a memory limit.
           resources:
             requests:
               cpu: 100m
@@ -95,6 +133,10 @@ spec:
               cpu: "1"
               memory: 1Gi
       volumes:
+        # Ephemeral: the SQLite DB, chroma index and audit trail are seeded
+        # fresh on each start. No sizeLimit — a first start builds the RAG
+        # index, and a too-small cap would fail it rather than protect
+        # anything.
         - name: data
           emptyDir: {}
         - name: tmp

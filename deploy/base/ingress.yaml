@@ -1,3 +1,9 @@
+# The host name is the one per-environment value this app has: FastAPI /
+# uvicorn validate nothing about the Host header (unlike Django's
+# ALLOWED_HOSTS), so the environment's difference is simply which name reaches
+# it. Each overlay replaces spec.rules[0].host, so the environments answer on
+# distinct *.localtest.me names (which resolve to 127.0.0.1) instead of all
+# fighting over one host. deploy/kind leaves the default below.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:

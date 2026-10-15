@@ -1,0 +1,49 @@
+# prod: gets only a digest that passed G3 in staging, and only after G4
+# (change approval). devsecops-release.yml (environment: prod) commits it
+# after G5. Argo CD app `alienbank-prod` syncs it with selfHeal; nothing else
+# writes to the namespace.
+#
+# Two replicas: the canary steps (50% → analysis → 100%) need two pods for
+# the 50% weight to mean anything, and prod is the only environment worth
+# canarying rather than short-circuiting.
+#
+# The only automated edit is the image digest below (set_digest.py).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: alienbank-prod
+
+resources:
+  - ../base
+
+patches:
+  - target: {kind: Rollout, name: alienbank}
+    patch: |
+      - op: replace
+        path: /spec/replicas
+        value: 2
+  - target: {kind: AnalysisTemplate, name: alienbank-canary-health}
+    patch: |
+      - op: test
+        path: /spec/metrics/0/provider/web/url
+        value: http://alienbank-canary.NAMESPACE.svc/login
+      - op: replace
+        path: /spec/metrics/0/provider/web/url
+        value: http://alienbank-canary.alienbank-prod.svc/login
+  - target: {kind: Ingress, name: alienbank}
+    patch: |
+      - op: test
+        path: /spec/rules/0/host
+        value: alienbank.localtest.me
+      - op: replace
+        path: /spec/rules/0/host
+        value: alienbank-prod.localtest.me
+
+images:
+  # Never a tag: admission (Kyverno require-image-digest, and
+  # verify-image-signatures which only ever admits a signed digest) requires
+  # image@sha256:…. All-zero is the placeholder until the first signed G2
+  # image exists; only devsecops-release.yml writes here, after G3 (staging)
+  # and G4 (change approval).
+  - name: alienbank
+    newName: ghcr.io/usfali-ke/alienbank
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000

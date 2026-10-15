@@ -1,0 +1,51 @@
+# dev: the first environment a build reaches. devsecops-release.yml
+# (environment: dev) commits the digest main's pipeline built, after G5.
+# Argo CD app `alienbank-dev` syncs it with selfHeal. The only automated edit
+# is the image digest below (set_digest.py).
+#
+# dev runs one replica: the SQLite DB and ChromaDB index live in each pod, so
+# the pipeline tests the pod it tests, nothing shared.
+#
+# alienbank has no ALLOWED_HOSTS-style list (FastAPI/uvicorn don't validate
+# Host), so the per-environment values are the Ingress host and the
+# AnalysisTemplate's namespace-qualified canary URL — both below.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: alienbank-dev
+
+resources:
+  - ../base
+
+patches:
+  - target: {kind: Rollout, name: alienbank}
+    patch: |
+      - op: replace
+        path: /spec/replicas
+        value: 1
+  - target: {kind: AnalysisTemplate, name: alienbank-canary-health}
+    patch: |
+      - op: test
+        path: /spec/metrics/0/provider/web/url
+        value: http://alienbank-canary.NAMESPACE.svc/login
+      - op: replace
+        path: /spec/metrics/0/provider/web/url
+        value: http://alienbank-canary.alienbank-dev.svc/login
+  - target: {kind: Ingress, name: alienbank}
+    patch: |
+      - op: test
+        path: /spec/rules/0/host
+        value: alienbank.localtest.me
+      - op: replace
+        path: /spec/rules/0/host
+        value: alienbank-dev.localtest.me
+
+images:
+  # Never a tag: admission (Kyverno require-image-digest, and
+  # verify-image-signatures which only ever admits a signed digest) requires
+  # image@sha256:…. The all-zero digest is the same placeholder deploy/kind
+  # shipped: no G2 build has pushed a signed alienbank image yet (every
+  # devsecops-build run on main has failed), so the first release commit —
+  # devsecops-release.yml running set_digest.py — replaces it.
+  - name: alienbank
+    newName: ghcr.io/usfali-ke/alienbank
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000

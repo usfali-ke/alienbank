@@ -1,23 +1,38 @@
-# GitOps source of truth for the kind environment. Argo CD (app `alienbank`,
-# created cluster-side) syncs this directory with selfHeal; nothing else
-# writes to the namespace. The only automated edit is the image digest below,
-# committed by devsecops-release.yml (G5) after G4 approves a change.
+# GitOps source of truth for the kind environment: an overlay of ../base.
+# Argo CD (app `alienbank`, created cluster-side) syncs this directory with
+# selfHeal; nothing else writes to the namespace.
+#
+# The only automated edit is the image digest below: devsecops-release.yml
+# (G5) runs set_digest.py against THIS file, and that script fails unless the
+# file holds exactly one digest key under `images:` — keep it to one.
+#
+# Analysistemplate: the template moved to ../base (every environment needs
+# it). `analysistemplate.yaml` beside this file is a symlink to
+# ../base/analysistemplate.yaml, kept only because
+# tests/unit/test_canary_analysis.py reads that exact path to pin the canary
+# contract against the app — the symlink keeps that test reading the template
+# that actually ships, instead of a stale copy. It is not listed under
+# `resources:` (../base already provides it).
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 namespace: alienbank
 
 resources:
-  - configmap.yaml
-  - services.yaml
-  - ingress.yaml
-  - analysistemplate.yaml
-  - rollout.yaml
+  - ../base
+
+patches:
+  - target: {kind: AnalysisTemplate, name: alienbank-canary-health}
+    patch: |
+      - op: replace
+        path: /spec/metrics/0/provider/web/url
+        value: http://alienbank-canary.alienbank.svc/login
 
 images:
   # TODO(first release): the all-zero digest is a placeholder — no image has
-  # been released yet, so the Rollout can't pull until the first
+  # been released yet (every devsecops-build run on main has failed, so nothing
+  # is pushed or signed), so the Rollout can't pull until the first
   # devsecops-release run replaces it with a G2-signed digest. Never put a
-  # tag here: admission (Kyverno) requires digests.
+  # tag here: admission (Kyverno require-image-digest) requires digests.
   - name: alienbank
     newName: ghcr.io/usfali-ke/alienbank
     digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
