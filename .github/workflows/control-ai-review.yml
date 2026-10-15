@@ -24,7 +24,7 @@ on:
         required: false
 jobs:
   control:
-    name: AI security review · Hermes
+    name: SAST · Hermes Agent
     # Fork PRs never run on the self-hosted runner (they get no secret either).
     if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: lab-runner
@@ -42,7 +42,7 @@ jobs:
           sparse-checkout: .github/scripts
       - id: verdict
         env:
-          HERMES_URL: ${{ vars.HERMES_WEBHOOK_URL || 'http://192.168.122.191:8644/webhooks/github-pr-review' }}
+          HERMES_URL: ${{ vars.HERMES_WEBHOOK_URL || 'https://hermes.usfali.com:46055/webhooks/github-pr-review' }}
           HERMES_SECRET: ${{ secrets.HERMES_WEBHOOK_SECRET }}
           HERMES_COMMENTER: ${{ vars.HERMES_COMMENTER }}
           GH_TOKEN: ${{ github.token }}

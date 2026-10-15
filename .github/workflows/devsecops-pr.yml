@@ -121,5 +121,13 @@ jobs:
         with:
           gate: G1
           needs: ${{ toJSON(needs) }}
-          subject: pr-${{ github.event.pull_request.number }}
-          commit-sha: ${{ github.event.pull_request.head.sha }}
+          # The merge gate runs on the pull request, where nothing is being
+          # promoted: record=false makes the action upload `gate-preview-G1`
+          # instead of `gate-result-G1`, the name the dashboard collects as
+          # CURRENT gate evidence. A PR run's pre-merge state (the author's
+          # unsigned commits, no reviewer yet, subject `pr-<number>`) must
+          # not enter the promotion evidence the Secure Gates metric is
+          # computed from — only a run on main records.
+          record: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
+          subject: ${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || github.sha }}
+          commit-sha: ${{ github.event.pull_request.head.sha || github.sha }}
