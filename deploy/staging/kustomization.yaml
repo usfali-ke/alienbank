@@ -1,0 +1,47 @@
+# staging: gets only a digest that is running and verified (G6) in dev.
+# devsecops-release.yml (environment: staging) commits it after G5, then runs
+# G3 against this namespace. Argo CD app `alienbank-stg`.
+#
+# One replica for the same reason as dev: the demo's SQLite DB and chroma
+# index live in each pod.
+#
+# The only automated edit is the image digest below (set_digest.py).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: alienbank-stg
+
+resources:
+  - ../base
+
+patches:
+  - target: {kind: Rollout, name: alienbank}
+    patch: |
+      - op: replace
+        path: /spec/replicas
+        value: 1
+  - target: {kind: AnalysisTemplate, name: alienbank-canary-health}
+    patch: |
+      - op: test
+        path: /spec/metrics/0/provider/web/url
+        value: http://alienbank-canary.NAMESPACE.svc/login
+      - op: replace
+        path: /spec/metrics/0/provider/web/url
+        value: http://alienbank-canary.alienbank-stg.svc/login
+  - target: {kind: Ingress, name: alienbank}
+    patch: |
+      - op: test
+        path: /spec/rules/0/host
+        value: alienbank.localtest.me
+      - op: replace
+        path: /spec/rules/0/host
+        value: alienbank-stg.localtest.me
+
+images:
+  # Never a tag: admission (Kyverno require-image-digest, and
+  # verify-image-signatures which only ever admits a signed digest) requires
+  # image@sha256:…. Every environment starts at the all-zero placeholder
+  # until the first signed G2 image exists; promotion replaces it and only
+  # devsecops-release.yml writes here.
+  - name: alienbank
+    newName: ghcr.io/usfali-ke/alienbank
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
