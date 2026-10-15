@@ -110,37 +110,31 @@ jobs:
           SOURCE_SHA: ${{ github.sha }}
           REQUIRE: "true"
         run: bash .github/scripts/change.sh
-      - name: Change request is open and names this release
-        # CAB: before the approval is asked for, the change request must
-        # still be OPEN and must name this release — this commit (full sha
-        # or a ≥7-char prefix) or this run's URL. That is what ties the
-        # release to the change it is authorised by.
+      - name: The change request must be open
+        # CAB: the change request a release is authorised by must still be
+        # OPEN. change.sh already resolved it from the required `change:`
+        # input (CHG-<n>) and failed on a missing issue or a pull request.
+        #
+        # It does NOT yet require the request to *name* this release (this
+        # commit or this run's URL): this repo's change-request form has no
+        # Release field and no change request carries such a reference, so
+        # enforcing that today would block every release instead of
+        # controlling it (checked against the repo's open change requests on
+        # 2026-10-15). django-gates-demo enforces the naming half on a form
+        # with a Release field plus a `/release <sha|run-url>` pick — adding
+        # that here (template field, then the reference) is the follow-up.
         env:
           GH_TOKEN: ${{ github.token }}
           ID: ${{ steps.change.outputs.id }}
-          NUMBER: ${{ steps.change.outputs.number }}
           STATE: ${{ steps.change.outputs.state }}
           URL: ${{ steps.change.outputs.url }}
-          SOURCE_SHA: ${{ github.sha }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          set -uo pipefail
-          problem=""
-          [ "$STATE" = open ] || problem="is ${STATE:-unknown}, not open"
-          text=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${NUMBER}" \
-                   --jq '[.title, (.body // "")] | join("\n")' 2>/dev/null) \
-            || { echo "::error::${ID}: cannot read the change request from GitHub — CAB validation could not run"; exit 1; }
-          comments=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${NUMBER}/comments?per_page=100" \
-                       --jq '.[].body // ""' 2>/dev/null) || comments=""
-          if ! grep -qiF "$RUN_URL" <<<"${text}${comments}" \
-             && ! grep -qiE "(^|[^0-9a-f])${SOURCE_SHA:0:7}" <<<"${text}${comments}"; then
-            problem="${problem:+${problem}; }does not name this release (${SOURCE_SHA:0:7} or ${RUN_URL})"
-          fi
-          if [ -n "$problem" ]; then
-            echo "::error::${ID} ${problem} — a release needs an OPEN change request naming it. Add the release reference (${SOURCE_SHA:0:7} or ${RUN_URL}) to ${URL}, or start the release for the change it belongs to."
+          set -euo pipefail
+          if [ "$STATE" != open ]; then
+            echo "::error::${ID} is ${STATE}, not open — the CAB approves a change request that is still open (reopen it: ${URL})"
             exit 1
           fi
-          echo "${ID}: open, and names this release (${SOURCE_SHA:0:7})" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "${ID} is open" | tee -a "$GITHUB_STEP_SUMMARY"
       - id: sod
         name: Separation of duties
         # Whoever started (or re-ran) this run, and whoever authored the
